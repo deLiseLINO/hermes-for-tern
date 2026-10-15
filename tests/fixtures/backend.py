@@ -17,7 +17,7 @@ for line in sys.stdin:
     frame = json.loads(line)
     method, rid = frame.get("method"), frame.get("id")
     if method == "client.capabilities":
-        send({"id": rid, "result": {"server_requests": ["approval"]}})
+        send({"id": rid, "result": {"server_requests": ["clarify"]}})
     elif method == "session.create":
         send(
             {
@@ -25,36 +25,46 @@ for line in sys.stdin:
                 "result": {
                     "session_id": "qa",
                     "stored_session_id": "qa",
+                    "subscription_id": "qa-viewer",
+                    "revision": 0,
+                    "execution_generation": 1,
+                    "replay_epoch": "qa",
+                    "last_sequence": 0,
+                    "running": False,
+                    "pending": [],
+                    "prompts": [],
+                    "display_messages": [],
                     "info": {"model": "UI test · no model calls"},
                 },
             }
         )
     elif method == "prompt.submit":
-        send({"id": rid, "result": {"status": "streaming"}})
-        event("message.start")
         send(
-            {
-                "id": "srq-approval",
-                "method": "approval",
-                "params": {
-                    "session_id": "qa",
-                    "request_id": "approval-qa",
-                    "choices": ["once", "deny"],
-                    "description": "Controlled UI test. This does not execute a command.",
-                    "command": "printf 'approval-ui-ok\\n'",
-                },
-            }
+            {"id": rid, "result": {"status": "started", "admission_id": "qa-turn", "execution_generation": 1}}
         )
-    elif method == "approval.received":
-        send({"id": rid, "result": {"acknowledged": True}})
+        event("message.start")
+        event(
+            "approval.request",
+            {
+                "kind": "approval",
+                "prompt_id": "approval-qa",
+                "execution_generation": 1,
+                "choices": ["once", "deny"],
+                "description": "Controlled UI test. This does not execute a command.",
+                "command": "printf 'approval-ui-ok\\n'",
+            },
+        )
     elif method == "session.interrupt":
-        event("request.cancel", {"id": "srq-approval", "method": "approval", "reason": "interrupted"})
+        event("approval.settled", {"prompt_id": "approval-qa"})
         event("message.complete", {"status": "interrupted"})
         send({"id": rid, "result": {"status": "interrupted"}})
-    elif method == "session.close":
-        send({"id": rid, "result": {"closed": True}})
-    elif rid == "srq-approval":
-        choice = frame.get("result", {}).get("choice", "deny")
+    elif method == "session.detach":
+        send({"id": rid, "result": {"detached": True}})
+        break
+    elif method == "approval.respond":
+        choice = frame["params"]["choice"]
+        send({"id": rid, "result": {"prompt_id": "approval-qa", "status": "resolved"}})
+        event("approval.settled", {"prompt_id": "approval-qa"})
         event("message.complete", {"status": "complete", "text": f"Approval answer received: {choice}."})
     else:
         send({"id": rid, "error": {"code": -32601, "message": "Unknown method"}})

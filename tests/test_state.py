@@ -395,3 +395,86 @@ def test_the_ring_follows_the_level_hermes_reports_rather_than_the_one_asked_for
     state.effort = "high"
     state.event("session.info", {"model": "muse-spark-1.3"})
     assert state.effort == "high"
+
+
+def test_canonical_tool_result_and_direct_usage_are_rendered():
+    state = Conversation()
+    state.begin("inspect")
+    state.event("tool.start", {"tool_call_id": "call", "tool_name": "terminal", "args": {"command": "pwd"}})
+    state.event(
+        "tool.complete",
+        {
+            "tool_call_id": "call",
+            "tool_name": "terminal",
+            "result": "permission denied",
+            "is_error": True,
+            "duration_s": 0.2,
+        },
+    )
+    state.event("session.usage", {"total": 250, "cost": 0.125})
+    assert state.tools["call"].name == "terminal" and state.tools["call"].target == "pwd"
+    assert state.tools["call"].status == "error" and state.tools["call"].text == "permission denied"
+    assert state.cost() == "$0.125 · 250 tokens"
+
+
+def test_settled_prompt_disappears_without_any_local_answer():
+    state = Conversation()
+    state.event(
+        "approval.request",
+        {"kind": "approval", "prompt_id": "p", "execution_generation": 8, "choices": ["once", "deny"]},
+    )
+    assert state.approval().generation == 8
+    state.event("approval.settled", {"prompt_id": "p", "execution_generation": 8})
+    assert state.approval() is None
+
+
+def test_pending_user_projection_deduplicates_current_input_but_keeps_repeated_new_input():
+    for projected_identity in (False, True):
+        state = Conversation()
+        message = {"role": "user", "text": "same text"}
+        if projected_identity:
+            message["input_id"] = "first"
+        pending = [{"admission_id": "a", "input_id": "first", "text": "same text", "status": "started"}]
+        state.snapshot(
+            {
+                "display_messages": [message, {"role": "assistant", "text": "partial"}],
+                "running": True,
+                "pending": pending,
+            },
+            history=True,
+        )
+        state.snapshot({"running": True, "pending": pending}, history=False)
+        state.event("session.info", {"running": True, "pending": pending})
+        assert [row.text for row in state.rows if row.kind == "user"] == ["same text"]
+        state.event("message.start", {"admission_id": "a"})
+        state.event("message.complete", {"text": "first reply", "admission_id": "a"})
+        state.snapshot(
+            {
+                "running": True,
+                "pending": [
+                    {"admission_id": "b", "input_id": "second", "text": "same text", "status": "started"}
+                ],
+            },
+            history=False,
+        )
+        assert [(row.kind, row.text) for row in state.rows if row.kind in ("user", "assistant")] == [
+            ("user", "same text"),
+            ("assistant", "partial"),
+            ("assistant", "first reply"),
+            ("user", "same text"),
+        ]
+
+
+def test_snapshot_effort_sets_the_ring_before_its_first_click():
+    for history in (False, True):
+        state = Conversation()
+        state.snapshot({"info": {"reasoning_effort": "high"}}, history=history)
+        assert state.effort == "high"
+        assert state.cycle_effort() == "xhigh"
+
+
+def test_peer_model_update_changes_the_selected_provider():
+    state = Conversation()
+    state.info = {"model": "old-model", "provider": "prism"}
+    state.event("session.updated", {"operation": "model", "model": "gpt-6-luna", "provider": "openai-codex"})
+    assert state.info == {"model": "gpt-6-luna", "provider": "openai-codex"}

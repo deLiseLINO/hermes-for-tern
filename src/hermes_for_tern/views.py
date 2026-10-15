@@ -24,7 +24,7 @@ COMMAND_ROWS = (
     ("/name <title>", "name this session"),
     ("/resume [session]", "pick up an earlier session, by its id or title or from the list"),
     ("/cost", "what this session has spent"),
-    ("/doctor", "launcher, backend, protocol and session"),
+    ("/doctor", "launcher, gateway, protocol and session"),
     ("/clear", "empty the transcript; Hermes still remembers"),
     ("/stop", "stop the running turn"),
     ("/help", "Hermes's commands, and these"),

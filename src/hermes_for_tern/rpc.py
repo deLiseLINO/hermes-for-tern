@@ -1,5 +1,3 @@
-"""Private, bidirectional JSON-RPC connection to an owned Hermes backend."""
-
 from __future__ import annotations
 
 import json
@@ -16,6 +14,7 @@ from pathlib import Path
 class RpcError(RuntimeError):
     def __init__(self, error: dict):
         self.code = error.get("code")
+        self.data = error.get("data") or {}
         super().__init__(str(error.get("message", "Hermes request failed")))
 
 
@@ -109,11 +108,11 @@ class Backend:
             # Keep diagnostics in memory; never print backend output into the surface PTY.
             self.logs.append(line.rstrip())
 
-    def close(self, session_id: str | None = None) -> None:
+    def close(self, farewell: tuple[str, dict] | None = None) -> None:
         self._closing = True
-        if self.process.poll() is None and session_id:
+        if self.process.poll() is None and farewell:
             try:
-                self.request("session.close", {"session_id": session_id}).result(timeout=2)
+                self.request(*farewell).result(timeout=2)
             except Exception:
                 pass
         if self.process.stdin:

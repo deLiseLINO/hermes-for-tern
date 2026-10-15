@@ -15,13 +15,31 @@ class Demo:
         self.lock = threading.Lock()
         self.stop = threading.Event()
         self.worker: threading.Thread | None = None
+        self.revision = 0
+        self.generation = 0
+        self.sequence = 0
+        self.admission = ""
+        self.title = ""
+        self.model = "Visual demo · no model calls"
 
     def send(self, **frame):
         with self.lock:
             print(json.dumps({"jsonrpc": "2.0", **frame}), flush=True)
 
     def event(self, kind: str, payload: dict | None = None):
-        self.send(method="event", params={"session_id": "demo", "type": kind, "payload": payload or {}})
+        self.sequence += 1
+        self.send(
+            method="event",
+            params={
+                "session_id": "demo",
+                "type": kind,
+                "payload": payload or {},
+                "seq": self.sequence,
+                "replay_epoch": "demo",
+                "execution_generation": self.generation,
+                "admission_id": self.admission,
+            },
+        )
 
     def run_demo(self):
         phases = [
@@ -114,12 +132,22 @@ class Demo:
             rid, method = frame.get("id"), frame.get("method")
             if method == "client.capabilities":
                 self.send(id=rid, result={"server_requests": []})
-            elif method == "session.create":
+            elif method in ("session.create", "session.resume"):
                 self.send(
                     id=rid,
                     result={
                         "session_id": "demo",
-                        "info": {"model": "Visual demo · no model calls", "demo": True},
+                        "stored_session_id": "demo",
+                        "subscription_id": "demo-viewer",
+                        "revision": self.revision,
+                        "execution_generation": self.generation,
+                        "replay_epoch": "demo",
+                        "last_sequence": self.sequence,
+                        "running": bool(self.worker and self.worker.is_alive()),
+                        "pending": [],
+                        "prompts": [],
+                        "display_messages": [],
+                        "info": {"model": self.model, "demo": True, "title": self.title},
                     },
                 )
             elif method == "prompt.submit":
@@ -127,17 +155,52 @@ class Demo:
                     self.send(id=rid, error={"code": -32000, "message": "Demo is already running"})
                     continue
                 self.stop.clear()
-                self.send(id=rid, result={"status": "streaming"})
+                self.generation += 1
+                self.admission = frame.get("params", {}).get("submission_id", "")
+                self.send(
+                    id=rid,
+                    result={
+                        "status": "started",
+                        "admission_id": self.admission,
+                        "execution_generation": self.generation,
+                    },
+                )
                 self.worker = threading.Thread(target=self.run_demo, daemon=True)
                 self.worker.start()
+            elif method == "session.mutate":
+                params = frame.get("params") or {}
+                if params.get("expected_revision") != self.revision:
+                    self.send(id=rid, error={"code": 4001, "message": "stale_revision"})
+                    continue
+                if params.get("operation") == "rename":
+                    self.title = params["payload"]["title"]
+                elif params.get("operation") == "model":
+                    if params.get("expected_generation") != self.generation:
+                        self.send(id=rid, error={"code": 4001, "message": "stale_generation"})
+                        continue
+                    self.model = params["payload"]["model"]
+                else:
+                    self.send(id=rid, error={"code": 4001, "message": "invalid_params"})
+                    continue
+                self.revision += 1
+                result = {
+                    "session_id": "demo",
+                    "revision": self.revision,
+                    "execution_generation": self.generation,
+                    "operation": params["operation"],
+                    "title": self.title,
+                    "model": self.model,
+                }
+                self.send(id=rid, result=result)
+                self.event("session.updated", result)
             elif method == "session.interrupt":
                 self.stop.set()
                 self.send(id=rid, result={"status": "interrupted"})
-            elif method == "session.close":
+            elif method == "session.detach":
                 self.stop.set()
                 if self.worker:
                     self.worker.join(timeout=2)
-                self.send(id=rid, result={"closed": True})
+                self.send(id=rid, result={"detached": True})
                 return
             else:
                 self.send(id=rid, error={"code": -32601, "message": "Unsupported demo request"})

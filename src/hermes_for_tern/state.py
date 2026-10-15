@@ -6,7 +6,7 @@ import json
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 # Streamed text is released at an even pace: a backlog drains in about DRAIN seconds,
 # never slower than MIN_RATE characters per second.
@@ -78,6 +78,48 @@ def readable(value: Any) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value, ensure_ascii=False, indent=2) if value is not None else ""
+
+
+@dataclass
+class Attachment:
+    session_id: str
+    subscription_id: str
+    revision: int
+    execution_generation: int
+    replay_epoch: str
+    last_sequence: int
+
+    @classmethod
+    def snapshot(cls, result: dict) -> Attachment:
+        return cls(
+            *(
+                result[key]
+                for key in (
+                    "session_id",
+                    "subscription_id",
+                    "revision",
+                    "execution_generation",
+                    "replay_epoch",
+                    "last_sequence",
+                )
+            )
+        )
+
+    def update(self, values: dict) -> None:
+        for key in ("revision", "execution_generation"):
+            value = values.get(key)
+            if type(value) is int:
+                setattr(self, key, max(getattr(self, key), value))
+
+    def farewell(self) -> tuple[str, dict]:
+        return "session.detach", {"session_id": self.session_id, "subscription_id": self.subscription_id}
+
+
+@dataclass
+class Turn:
+    phase: Literal["idle", "active", "awaiting_terminal", "unknown", "disconnected"] = "idle"
+    admission_id: str | None = None
+    submission_id: str | None = None
 
 
 @dataclass
@@ -227,6 +269,7 @@ class Question:
     params: dict
     index: int = 0
     answers: dict[str, str | None] = field(default_factory=dict)
+    generation: int | None = None
     selected: set[str] = field(default_factory=set)
 
     @property
@@ -245,6 +288,7 @@ class Sheet:
     query: str = ""
     chosen: str = ""
     confirming: bool = False  # Hermes asked whether the expensive pick is worth it
+    confirm: str | None = None
 
 
 @dataclass
@@ -284,7 +328,10 @@ class Conversation:
         self.sessions: list[dict] | None = None
         self.earlier: dict | None = None
         self.info: dict = {}
-        self.busy = False
+        self.turn = Turn()
+        self.pending_admissions: dict[str, dict] = {}
+        self.receipts: dict[str, dict] = {}
+        self.input_ids: set[str] = set()
         self.ready = False
         self.failed = False
         self.activity = "Connecting to Hermes"
@@ -321,6 +368,14 @@ class Conversation:
         # The composer's live command list, while a `/command` is being typed.
         self.slash = Slash()
 
+    @property
+    def busy(self) -> bool:
+        return self.turn.phase != "idle" or bool(self.pending_admissions or self.questions)
+
+    @property
+    def unknown(self) -> bool:
+        return self.turn.phase in ("unknown", "disconnected")
+
     def touch(self) -> None:
         self.revision += 1
 
@@ -335,6 +390,60 @@ class Conversation:
         self.exit_armed = now
         self.touch()
 
+    def prompt(self, payload: dict) -> None:
+        rid = str(payload["prompt_id"])
+        method = payload["kind"]
+        params = dict(payload)
+        if method == "clarify":
+            params["questions"] = [
+                {
+                    "qid": rid,
+                    "question": payload.get("question", ""),
+                    "choices": payload.get("choices", []),
+                    "multi_select": payload.get("multi_select", False),
+                }
+            ]
+        previous = self.questions.get(rid)
+        if previous and previous.generation == payload["execution_generation"] and previous.method == method:
+            previous.params = params
+        else:
+            self.questions[rid] = Question(rid, method, params, generation=payload["execution_generation"])
+        self.touch()
+
+    def snapshot(self, result: dict, *, history: bool) -> None:
+        if history:
+            self.restore(result.get("display_messages") or [], result.get("info") or {})
+        self.info.update(result.get("info") or {})
+        self.title = str(self.info.get("title") or self.title)
+        reported = self.info.get("reasoning_effort")
+        if isinstance(reported, str) and reported:
+            self.effort = ring_effort(reported)
+        prompts = result.get("prompts") or []
+        identities = {(str(prompt["prompt_id"]), prompt["execution_generation"]) for prompt in prompts}
+        self.questions = {
+            rid: q
+            for rid, q in self.questions.items()
+            if q.generation is None or (rid, q.generation) in identities
+        }
+        for prompt in prompts:
+            self.prompt(prompt)
+        if history:
+            self.turn = Turn()
+        pending = {row["admission_id"]: row for row in result.get("pending") or []}
+        self.pending_admissions = pending if history else {**self.pending_admissions, **pending}
+        for row in self.pending_admissions.values():
+            identity, text = row.get("input_id"), row.get("text")
+            if identity and text and identity not in self.input_ids:
+                last_user = next((item for item in reversed(self.rows) if item.kind == "user"), None)
+                if not history or row.get("status") != "started" or not last_user or last_user.text != text:
+                    self.add("user", text)
+                self.input_ids.add(identity)
+        self.observe_turn(result)
+        self.activity = "Outcome unknown" if self.unknown else "Working" if self.busy else "Ready"
+        self.ready = not self.unknown
+        self.failed = self.turn.phase == "disconnected"
+        self.touch()
+
     def restore(self, messages: list, info: dict) -> None:
         """Redraw a resumed session from what Hermes kept of it: your messages, its replies, and the
         tools it ran, finished and without their output, which Hermes does not keep for display."""
@@ -346,6 +455,8 @@ class Conversation:
             if role in ("user", "assistant") and text.strip():
                 self.add(role, text)
                 count += 1
+                if message.get("input_id"):
+                    self.input_ids.add(message["input_id"])
             elif role == "tool":
                 name = str(message.get("name") or "tool")
                 self.add("tool", name=name, target=str(message.get("context") or ""), status="done")
@@ -354,6 +465,24 @@ class Conversation:
         named = f" “{self.title}”" if self.title else ""
         self.add("notice", f"Resumed{named} · {count} message{'s' * (count != 1)} before this.")
 
+    def observe_turn(self, payload: dict) -> None:
+        if any(row.get("status") == "unknown" for row in self.pending_admissions.values()):
+            self.turn.phase = "unknown"
+        if self.unknown:
+            return
+        started = next(
+            (row for row in self.pending_admissions.values() if row.get("status") == "started"), None
+        )
+        if started and self.turn.phase == "idle":
+            self.turn = Turn("active", started["admission_id"])
+            self.last_prompt = str(started.get("text") or self.last_prompt)
+        elif started and self.turn.admission_id is None:
+            self.turn.admission_id = started["admission_id"]
+        if payload.get("running"):
+            self.turn.phase = "active"
+        elif payload.get("running") is False and self.turn.phase == "active":
+            self.turn.phase = "awaiting_terminal"
+
     def begin(self, text: str) -> None:
         self.last_prompt = text
         self.add("user", text)
@@ -361,7 +490,7 @@ class Conversation:
         self._turn_assistants = []
         self._errands = None
         self._thought = None
-        self.busy = True
+        self.turn = Turn("active")
         self.activity = "Thinking"
         self.turn_started = time.monotonic()
         self.heard = self.turn_started
@@ -506,6 +635,38 @@ class Conversation:
             self._errands.items = [dict(t) for t in self.todos]
 
     def event(self, kind: str, payload: dict) -> None:
+        if kind == "message.complete":
+            admission = payload.get("admission_id") or self.turn.admission_id
+            if admission:
+                self.pending_admissions.pop(admission, None)
+                if self.turn.admission_id and admission != self.turn.admission_id:
+                    self.touch()
+                    return
+        if kind in ("tool.start", "tool.complete"):
+            payload = {
+                **payload,
+                "tool_id": payload.get("tool_call_id", payload.get("tool_id", "")),
+                "name": payload.get("tool_name", payload.get("name", "Tool")),
+            }
+        if kind in ("approval.request", "clarify.request"):
+            self.prompt(payload)
+            return
+        if kind in ("approval.settled", "clarify.settled"):
+            rid = str(payload.get("prompt_id"))
+            question = self.questions.get(rid)
+            if question and payload.get("execution_generation", question.generation) == question.generation:
+                self.questions.pop(rid)
+            self.touch()
+            return
+        if kind == "session.updated":
+            if payload.get("title") is not None:
+                self.title = str(payload["title"])
+            if payload.get("model"):
+                self.info["model"] = payload["model"]
+            if payload.get("provider"):
+                self.info["provider"] = payload["provider"]
+            self.touch()
+            return
         if kind != "session.usage":
             self.heard = time.monotonic()
         if kind == "reasoning.delta":
@@ -526,20 +687,46 @@ class Conversation:
             self.settle()
         if kind == "session.info":
             self.info.update(payload)
+            if "pending" in payload:
+                self.pending_admissions.update({row["admission_id"]: row for row in payload["pending"]})
+                for row in self.pending_admissions.values():
+                    identity, text = row.get("input_id"), row.get("text")
+                    if identity and text and identity not in self.input_ids:
+                        self.add("user", text)
+                        self.input_ids.add(identity)
+                    if text and row.get("status") == "started":
+                        self.last_prompt = text
+            self.observe_turn(payload)
+            if not self.unknown:
+                self.activity = "Working" if self.busy else "Ready"
             # Hermes owns the level: it echoes the accepted effort, so after a clamp the ring
             # shows what was really applied rather than what was asked for.
             reported = payload.get("reasoning_effort")
             if isinstance(reported, str) and reported:
                 self.effort = ring_effort(reported)
-            self.ready = True
-            self.activity = "Ready" if not self.busy else self.activity
+            if not self.failed and not self.unknown:
+                self.ready = True
+                self.activity = "Ready" if not self.busy else self.activity
         elif kind == "message.start":
-            self.busy = True
-            self.activity = "Writing"
+            self._assistant = None
+            self._turn_assistants = []
+            self.turn_started = time.monotonic()
+            if not self.unknown:
+                started = next(
+                    (
+                        row["admission_id"]
+                        for row in self.pending_admissions.values()
+                        if row.get("status") == "started"
+                    ),
+                    None,
+                )
+                self.turn = Turn("active", payload.get("admission_id") or started or self.turn.admission_id)
+                self.activity = "Writing"
         elif kind == "message.delta":
             delta = str(payload.get("text", ""))
             self.assistant().text += delta
-            self.activity = "Writing"
+            if not self.unknown:
+                self.activity = "Writing"
         elif kind == "message.interim":
             text = str(payload.get("text", ""))
             if text:
@@ -587,11 +774,14 @@ class Conversation:
                 self.tools[tid] = row
             result = payload.get("result")
             row.exit_code = result.get("exit_code") if isinstance(result, dict) else None
-            is_error = isinstance(result, dict) and (
-                result.get("is_error")
-                or result.get("error")
-                or result.get("success") is False
-                or row.exit_code not in (None, 0)
+            is_error = payload.get("is_error") or (
+                isinstance(result, dict)
+                and (
+                    result.get("is_error")
+                    or result.get("error")
+                    or result.get("success") is False
+                    or row.exit_code not in (None, 0)
+                )
             )
             row.status = "error" if is_error else "done"
             output = result
@@ -652,20 +842,36 @@ class Conversation:
                     "error",
                     away=True,
                 )
-            self.busy = False
-            self.activity = "Ready"
+            if not self.unknown and (
+                not admission or not self.turn.admission_id or admission == self.turn.admission_id
+            ):
+                started = next(
+                    (row for row in self.pending_admissions.values() if row.get("status") == "started"), None
+                )
+                self.turn = Turn("active", started["admission_id"]) if started else Turn()
+                if started:
+                    self.last_prompt = str(started.get("text") or self.last_prompt)
+            self.activity = (
+                "Disconnected"
+                if self.turn.phase == "disconnected"
+                else "Outcome unknown"
+                if self.unknown
+                else "Waiting"
+                if self.busy
+                else "Ready"
+            )
             self._assistant = None
         elif kind == "session.title":
             self.title = str(payload.get("title") or "")
         elif kind == "session.usage":
-            self.usage = payload.get("usage") or {}
+            self.usage = payload.get("usage") or payload
         elif kind == "status.update":
             self.activity = str(payload.get("text") or "Working")[:140]
         elif kind == "error":
             self.add("error", str(payload.get("message", "Hermes reported an error")))
             if not self.ready:
                 self.failed = True
-                self.busy = False
+                self.turn = Turn("disconnected")
                 self.activity = "Could not start Hermes"
         elif kind == "notice":
             self.add("notice", str(payload.get("message", "")))
@@ -741,7 +947,14 @@ class Conversation:
     @property
     def can_retry(self) -> bool:
         last = next((r for r in reversed(self.rows) if r.kind not in ("notice",)), None)
-        return bool(last and last.kind == "error" and last.retryable and self.ready and not self.busy)
+        return bool(
+            last
+            and last.kind == "error"
+            and last.retryable
+            and self.ready
+            and not self.busy
+            and not self.unknown
+        )
 
     def subagent(self, kind: str, payload: dict) -> None:
         """Children join the delegate_task call that spawned them; late events never revive one."""
@@ -844,13 +1057,17 @@ class Conversation:
         self.touch()
 
     def listed(self, sessions: list) -> None:
-        """Hermes's recent sessions, newest first; the welcome offers the latest other than this one."""
-        self.sessions = [row for row in sessions if isinstance(row, dict) and row.get("id")]
+        self.sessions = sorted(
+            [row for row in sessions if isinstance(row, dict) and row.get("id")],
+            key=lambda row: row.get("started_at") or 0,
+            reverse=True,
+        )
         self.earlier = next(
             (
                 row
                 for row in self.sessions
-                if row["id"] != self.stored_session_id and (row.get("message_count") or 0) > 0
+                if row["id"] not in (self.session_id, self.stored_session_id)
+                and (row.get("message_count") or 0) > 0
             ),
             None,
         )
@@ -862,9 +1079,14 @@ class Conversation:
         self.questions.clear()
         self.queued.clear()
         self.title = ""
+        self.info = {}
+        self.turn_started = None
         self.last_prompt = ""
         self.resumed = False
-        self.busy = False
+        self.turn = Turn()
+        self.pending_admissions.clear()
+        self.receipts.clear()
+        self.input_ids.clear()
 
     def close_sheet(self) -> None:
         if self.sheet is not None:
