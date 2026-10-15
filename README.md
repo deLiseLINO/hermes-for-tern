@@ -19,7 +19,8 @@ Prerequisites:
 
 - macOS or Linux, Python 3.11+, Git and [uv](https://docs.astral.sh/uv/).
 - Tern with Surface Protocol v1, `dock`, and the native component vocabulary.
-- A working Hermes Agent installation and model configuration.
+- A configured Hermes Agent with a running gateway and the managed launcher's
+  `--print-runtime-command` interface. SSH connections also need Python 3 on the remote host.
 
 From this repository:
 
@@ -116,23 +117,47 @@ For a shorter run, use `hermes --demo 30` (seconds). Ordinary `hermes` still use
 Demo durations must be between 10 and 1,800 seconds. The demo requires Tern and does not fall back
 to the real agent in another terminal.
 
-### Backend compatibility
+### Connect to an existing gateway
 
-The default backend command uses Hermes's managed launcher:
+The adapter connects to the gateway that already serves your Hermes profile. It uses
+Hermes's managed runtime and authenticated WebSocket connection. It never launches
+`tui_gateway.entry`, starts or restarts the gateway, or installs Tern dependencies into Hermes.
 
-```text
-<original-hermes> --run-module tui_gateway.entry
-```
+For a gateway on another machine, configure an SSH destination and a workspace on that machine.
+The connection bridge runs there. SSH carries the conversation messages, and the authentication
+ticket stays on the remote host. The Mac's project path is not a remote workspace path.
 
-For a conventional Hermes virtualenv installation without `--run-module`, specify its backend:
+Install a remote target with an existing SSH alias and an absolute remote workspace path:
 
 ```sh
-uv run hermes-for-tern --install --backend '/absolute/path/to/hermes-venv/bin/python -u -m tui_gateway.entry'
+uv run hermes-for-tern --install --gateway-host work --gateway-cwd /home/work/projects/slop
 ```
 
-That interpreter must have Hermes's dependencies and its modules must be importable from your
-project directory. For example, install Hermes into its own virtualenv as an editable package.
-Do not install Tern dependencies into Hermes's managed environment.
+For an installed wrapper, edit `~/.config/hermes-for-tern/launcher.json`. Keep its launcher and
+backup fields. Remove `backend` and add this gateway target:
+
+```json
+"gateway": {
+	"host": "work",
+	"hermes": "hermes",
+	"cwd": "/home/work/projects/slop"
+}
+```
+
+Use `--gateway-hermes` if the remote launcher needs an explicit path. For one launch, override the
+target with `hermes --gateway-host work --gateway-cwd /home/work/projects/slop` inside Tern.
+If you omit the remote workspace, Hermes uses the gateway's default workspace. `--profile` selects
+the profile on the gateway host, not a profile on the Mac.
+
+Each pane is a viewer with its own connection. Exiting or switching sessions removes only that
+viewer. Another Tern pane or a Hermes client can keep the same session open. A running session
+resumes with its saved history and pending questions.
+
+If the gateway or SSH connection fails, the adapter reports the disconnection. It does not resend
+your prompt or start a separate agent. Reconnect and resume the session to inspect the outcome.
+
+Older installations that configured a `backend` command must replace it with an explicit gateway
+target. The standalone backend command is no longer supported.
 
 `--target /path/to/bin/hermes` can instead create a wrapper in a different directory placed
 earlier in `PATH`, preserving the existing launcher at its original location.
@@ -173,14 +198,15 @@ earlier in `PATH`, preserving the existing launcher at its original location.
   `/help` and `/quit`. Hermes runs its commands the way its own terminal does (`slash.exec`, then
   `command.dispatch` for skills and commands that need the live session) and refuses what may not run
   mid-turn itself. A short answer is a note; a long one folds to a few lines that open in place.
-  `/doctor` reports the launcher, backend command, protocol version and session in the pane.
+  `/doctor` reports the launcher, gateway target, protocol version and session in the pane.
 - The model sheet: `/model` (or a click on the model name in the status strip) opens Hermes's whole
   catalog as a native sheet over the composer — every model of every provider, with its price and
   the credential a provider without one needs, under a heading per provider. A search field at the
   top shows what you type: typing filters, arrows move, `Enter` switches,
   `Escape` to put it away; clicking a row switches straight away. `/model <name>` switches without
-  the sheet. A model Hermes calls expensive asks first; a pick made mid-turn is held for the next
-  turn start and says so, and the status strip follows what Hermes reports back.
+  the sheet. Hermes asks for confirmation when a model needs it. The gateway checks the session's
+  revision and execution generation before applying a change. A busy or changed session reports
+  the refusal instead of silently deferring the model selection.
 - A watched subagent: click a child's row to open its live transcript (`subagent.tail`, refreshed),
   with interrupt and a line to steer it (`subagent.steer`; a child past its last tool batch misses it,
   which the dispatch says). Steer is typed while watching, `Enter` sends, `Escape` stops watching.
@@ -222,9 +248,9 @@ earlier in `PATH`, preserving the existing launcher at its original location.
   Hermes has named the session.
 - Switching sessions inside the pane: `/resume` (or `/sessions`) opens a sheet of Hermes's 50 most
   recent sessions, newest first, each with its title (or how it began), size and age; type to filter,
-  arrows to move, `Enter` to pick one up. Its conversation replaces the transcript and this live
-  session is closed in Hermes; nothing is lost, since Hermes keeps every session. `/resume <id or
-  title>` skips the sheet, and switching waits until a running turn ends. A new session's welcome
+  arrows to move, `Enter` to pick one up. Its conversation replaces the transcript and this pane
+  detaches from the previous session without ending it in other clients. `/resume <id or title>`
+  skips the sheet. Finish or stop the current turn before switching sessions. A new session's welcome
   offers `Continue “…”` for the last conversation. The sheet lists sessions from every project,
   as Hermes's own picker does: Hermes's listing does not say which folder a session ran in.
 - Ordinary Hermes subcommands, including `hermes model`, `hermes doctor` and `hermes --version`,
@@ -275,7 +301,7 @@ The uninstaller refuses to overwrite a launcher that somebody changed after inst
 ## Architecture
 
 ```text
-Tern pane ⇄ Surface Protocol ⇄ Python adapter ⇄ JSON-RPC pipes ⇄ Hermes tui_gateway
+Tern pane ⇄ Surface Protocol ⇄ Python adapter ⇄ JSON-RPC pipes ⇄ connection bridge ⇄ Hermes gateway
 ```
 
 - `launcher.py`: reversible installation, surface detection and original-command fallback.
@@ -289,7 +315,8 @@ Tern pane ⇄ Surface Protocol ⇄ Python adapter ⇄ JSON-RPC pipes ⇄ Hermes 
 
 The UI polls Tern input continuously while a background reader queues Hermes events.
 Render updates are batched at roughly 30 Hz; the SDK handles diffing, credits and terminal cleanup.
-The backend runs in a separate process with private pipes. Its stdout never reaches the pane directly.
+The bridge connects to the existing gateway. It does not start an agent or stop the gateway.
+Closing a pane detaches that viewer. Other clients can continue the same session.
 
 ## MVP boundaries
 

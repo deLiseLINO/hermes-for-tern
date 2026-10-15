@@ -11,7 +11,7 @@ def demo(tmp_path: Path, duration: str):
     )
     backend.request("client.capabilities", {}).result(timeout=2)
     assert backend.request("session.create", {}).result(timeout=2)["info"]["demo"]
-    backend.request("prompt.submit", {"text": "start"}).result(timeout=2)
+    backend.request("prompt.submit", {"text": "start", "submission_id": "demo-input"}).result(timeout=2)
     return backend
 
 
@@ -36,7 +36,7 @@ def test_demo_finishes_all_five_simulated_phases(tmp_path):
         assert frames[-1]["payload"]["status"] == "complete"
         assert any(f["type"] == "demo.progress" and f["payload"]["value"] == 1 for f in frames)
     finally:
-        backend.close("demo")
+        backend.close(("session.detach", {"session_id": "demo", "subscription_id": "demo-viewer"}))
 
 
 def test_demo_interrupt_stops_the_worker_without_finishing_remaining_phases(tmp_path):
@@ -47,4 +47,4 @@ def test_demo_interrupt_stops_the_worker_without_finishing_remaining_phases(tmp_
         assert frames[-1]["payload"]["status"] == "interrupted"
         assert sum(f["type"] == "tool.complete" for f in frames) == 0
     finally:
-        backend.close("demo")
+        backend.close(("session.detach", {"session_id": "demo", "subscription_id": "demo-viewer"}))

@@ -12,6 +12,8 @@ from pathlib import Path
 
 import tern_sdk
 
+from .gateway import GatewayTarget
+
 MARKER = "# hermes-for-tern managed launcher"
 
 
@@ -47,15 +49,24 @@ def original_command(config: dict) -> str:
     return found
 
 
-def backend_command(original: str, config: dict) -> list[str]:
-    if config.get("backend"):
-        return list(config["backend"])
-    # Hermes's managed launcher bootstraps the correct interpreter and dependencies.
-    # Conventional virtualenv installations can use an explicit --backend command.
-    return [original, "--run-module", "tui_gateway.entry"]
+def gateway_target(original: str, config: dict, options: dict | None = None) -> GatewayTarget:
+    if "backend" in config:
+        raise RuntimeError(
+            "Replace launcher.json backend with gateway {host, hermes, cwd}; standalone backends are no longer supported."
+        )
+    gateway = config.get("gateway") or {}
+    if not isinstance(gateway, dict) or set(gateway) - {"host", "hermes", "cwd"}:
+        raise ValueError("gateway must contain only host, hermes and cwd")
+    options = options or {}
+    host = options.get("gateway_host", gateway.get("host"))
+    return GatewayTarget(
+        options.get("gateway_hermes", gateway.get("hermes")) or ("hermes" if host else original),
+        host,
+        options.get("gateway_cwd", gateway.get("cwd")),
+    )
 
 
-def install(target: Path | None = None, backend: list[str] | None = None) -> None:
+def install(target: Path | None = None, gateway: GatewayTarget | None = None) -> None:
     config = settings()
     if config:
         raise RuntimeError("A launcher is already installed. Uninstall it before reinstalling.")
@@ -80,7 +91,14 @@ def install(target: Path | None = None, backend: list[str] | None = None) -> Non
     try:
         path.write_text(
             json.dumps(
-                {"target": str(target), "original": fallback, "replaced": replacing, "backend": backend},
+                {
+                    "target": str(target),
+                    "original": fallback,
+                    "replaced": replacing,
+                    "gateway": {"host": gateway.host, "hermes": gateway.hermes, "cwd": gateway.cwd}
+                    if gateway
+                    else {},
+                },
                 indent=2,
             )
             + "\n"
@@ -130,6 +148,9 @@ def native_options(args: list[str]) -> dict | None:
     # Hermes's own ways back into a session: `--resume <id|title|latest>`, and `-c [title]`.
     parser.add_argument("--resume", "-r")
     parser.add_argument("--continue", "-c", dest="continue_last", nargs="?", const=True)
+    parser.add_argument("--gateway-host")
+    parser.add_argument("--gateway-hermes")
+    parser.add_argument("--gateway-cwd")
     try:
         parsed, unknown = parser.parse_known_args(args)
     except SystemExit:
@@ -146,9 +167,16 @@ def main(argv: list[str] | None = None) -> int:
             parser = argparse.ArgumentParser(description="Install a reversible hermes launcher")
             parser.add_argument("--install", action="store_true")
             parser.add_argument("--target", type=Path)
-            parser.add_argument("--backend", help="Explicit backend command for conventional Hermes installs")
+            parser.add_argument("--gateway-host")
+            parser.add_argument("--gateway-hermes")
+            parser.add_argument("--gateway-cwd")
             parsed = parser.parse_args(args)
-            install(parsed.target, shlex.split(parsed.backend) if parsed.backend else None)
+            gateway = (
+                GatewayTarget(parsed.gateway_hermes or "hermes", parsed.gateway_host, parsed.gateway_cwd)
+                if any((parsed.gateway_host, parsed.gateway_hermes, parsed.gateway_cwd))
+                else None
+            )
+            install(parsed.target, gateway)
             return 0
         if args == ["--uninstall"]:
             uninstall()
@@ -157,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
         original = original_command(config)
         if args == ["--doctor"]:
             print("Original Hermes:", original)
-            print("Backend command:", shlex.join(backend_command(original, config)))
+            print("Existing gateway:", gateway_target(original, config).describe())
             print("Tern SDK:", tern_sdk.wire.VERSION, "(protocol)")
             print("Installed wrapper:", config.get("target", "not installed"))
             return 0
@@ -165,19 +193,24 @@ def main(argv: list[str] | None = None) -> int:
             return passthrough(original, args[1:])
         options = native_options(args)
         if options is None:
+            if any(arg.startswith("--gateway-") for arg in args):
+                raise RuntimeError("Gateway options apply only to native interactive chat.")
             return passthrough(original, args)
         session = tern_sdk.connect(app="hermes", version="0.1.0", features=("edit", "undo", "send"))
         if session is None:
             if options.get("demo") is not None:
                 raise RuntimeError("The visual demo needs Tern. Run hermes --demo inside Tern.")
+            if any(key.startswith("gateway_") for key in options):
+                raise RuntimeError("Gateway overrides need the native Tern frontend. Run Hermes inside Tern.")
             return passthrough(original, args)
         required = {"col", "card", "md", "editor", "tool", "el"}
         if not required.issubset(session.caps.kinds) or not session.caps.has("dock"):
             session.close()
+            if any(key.startswith("gateway_") for key in options):
+                raise RuntimeError("This Tern version cannot display the native gateway frontend.")
             return passthrough(original, args)
         from .app import App
 
-        command = backend_command(original, config)
         if options.get("demo") is not None:
             duration = options["demo"]
             if not 10 <= duration <= 1800:
@@ -191,6 +224,12 @@ def main(argv: list[str] | None = None) -> int:
                 "--duration",
                 str(duration),
             ]
+        else:
+            target = gateway_target(original, config, options)
+            command = target.command(options.get("profile"))
+            options["gateway_cwd"] = target.cwd if target.host else target.cwd or str(Path.cwd())
+            options["gateway_host"] = target.host
+            options["gateway_hermes"] = target.hermes
         return App(session, command, Path.cwd(), options).run()
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"Hermes for Tern: {exc}", file=sys.stderr)

@@ -5,17 +5,30 @@ from __future__ import annotations
 import queue
 import shlex
 import time
+from collections import deque
 from concurrent.futures import Future
 from pathlib import Path
+from uuid import uuid4
 
 import tern_sdk
 from tern_sdk import EditEvent, ErrorEvent, FocusEvent, GoneEvent, Key, SendEvent, UndoEvent, VisibleEvent
 
 from .editor import Draft
+from .gateway import GatewayTarget
 from .rpc import Backend
-from .state import SECRET_METHODS, TAIL, Conversation, Question, hermes_effort
+from .state import SECRET_METHODS, TAIL, Attachment, Conversation, Question, Turn, hermes_effort
 from .design import CSS, DARK, LIGHT, send_assets
-from .views import ALIASES, COMMAND_ROWS, sheet_cursor, sheet_rows, slash_open, slash_rows, slash_typed, view
+from .views import (
+    ALIASES,
+    COMMAND_ROWS,
+    model_rows,
+    sheet_cursor,
+    sheet_rows,
+    slash_open,
+    slash_rows,
+    slash_typed,
+    view,
+)
 
 # Keys that pick a question's choice, in the order the card shows them.
 DIGITS = "123456789"
@@ -36,8 +49,23 @@ class App:
         self.session = session
         self.command = command
         self.cwd = cwd
+        self.profile = options.get("profile")
+        self.gateway = (
+            GatewayTarget(
+                options.get("gateway_hermes") or "hermes",
+                options.get("gateway_host"),
+                options.get("gateway_cwd"),
+            )
+            if options.get("demo") is None
+            else None
+        )
+        self.session_cwd = self.gateway.cwd if self.gateway else None
+        if self.session_cwd is None and (self.gateway is None or self.gateway.host is None):
+            self.session_cwd = str(cwd)
         self.options = {
-            key: value for key, value in options.items() if key not in ("demo", "resume", "continue_last")
+            key: value
+            for key, value in options.items()
+            if key not in ("demo", "resume", "continue_last", "profile") and not key.startswith("gateway_")
         }
         # The session to pick up instead of starting one: an id or title, or "latest", Hermes's word
         # for the newest (what a bare `-c` continues).
@@ -47,6 +75,12 @@ class App:
         )
         self.demo_duration = options.get("demo")
         self.state = Conversation()
+        self.attachment: Attachment | None = None
+        self.request_params: dict[Future, dict] = {}
+        self.mutations: dict[Future, tuple[str, dict]] = {}
+        self.list_feeds: dict[str, list] = {}
+        self.resume_by_title = False
+        self.deferred_events: deque[dict] = deque()
         self.draft = Draft()
         self.answer_draft = Draft()
         self.secret = Draft()
@@ -57,7 +91,6 @@ class App:
         self.exit = False
         self.pending: list[tuple[str, Future, float]] = []
         self.start_deadline = time.monotonic() + 60
-        self._ack_approvals: list[str] = []
         # What each in-flight slash request was for: the draft a completion answers, or the command.
         self.asked: dict[Future, str] = {}
         self.completing: Future | None = None
@@ -68,6 +101,7 @@ class App:
         assert self.backend
         future = self.backend.request(method, params)
         self.pending.append((method, future, time.monotonic() + 60))
+        self.request_params[future] = params or {}
         return future
 
     def scoped(self, **params) -> dict:
@@ -94,6 +128,7 @@ class App:
                     if (
                         not self.state.ready
                         and not self.state.failed
+                        and not self.state.unknown
                         and time.monotonic() > self.start_deadline
                     ):
                         self.fail("Hermes took too long to start. Type /doctor for the details.")
@@ -118,7 +153,7 @@ class App:
                         self.input(item)
             finally:
                 if self.backend:
-                    self.backend.close(self.state.session_id)
+                    self.backend.close(self.attachment.farewell() if self.attachment else None)
         # The surface is gone; the pane's own terminal keeps this in its scrollback.
         hint = self.resume_hint()
         if hint:
@@ -150,20 +185,16 @@ class App:
                 self.resume_session,
             )
         )
-        if self.backend:
-            for rid in self._ack_approvals:
-                question = self.state.questions.get(rid)
-                if question:
-                    request_id = question.params.get("request_id")
-                    if request_id:
-                        self.request("approval.received", self.scoped(request_id=request_id))
-            self._ack_approvals.clear()
 
     def fail(self, message: str) -> None:
+        if self.attachment:
+            message += " Turn outcome is unknown. Do not resend the work. " + (
+                self.resume_hint() or f"Resume {self.attachment.session_id} to inspect it."
+            )
         self.state.add("error", message)
         self.state.failed = True
         self.state.ready = False
-        self.state.busy = False
+        self.state.turn.phase = "disconnected"
         self.state.activity = "Disconnected"
         self.state.touch()
 
@@ -173,13 +204,23 @@ class App:
         # Bounded draining keeps a flood of tool events from starving the keyboard.
         for _ in range(200):
             try:
-                frame = self.backend.events.get_nowait()
+                attaching = self.attachment is None or any(
+                    method in ("session.resume", "session.create") for method, _, _ in self.pending
+                )
+                frame = (
+                    self.deferred_events.popleft()
+                    if self.deferred_events and not attaching
+                    else self.backend.events.get_nowait()
+                )
             except queue.Empty:
                 break
             if "local_error" in frame:
                 self.fail(frame["local_error"])
             elif frame.get("method") == "event":
                 params = frame.get("params", {})
+                if params.get("session_id") and params.get("type") != "gateway.ready" and (attaching):
+                    self.deferred_events.append(frame)
+                    continue
                 if (
                     params.get("session_id")
                     and self.state.session_id
@@ -189,13 +230,43 @@ class App:
                 kind = params.get("type", "")
                 if kind == "gateway.ready":
                     self.request("client.capabilities", {"server_requests": True})
+                elif kind == "session.replay_gap":
+                    self.outcome_unknown("Session event history has a gap.")
                 else:
+                    attachment = self.attachment
+                    if attachment:
+                        epoch, sequence = params.get("replay_epoch"), params.get("seq")
+                        if epoch and epoch != attachment.replay_epoch:
+                            self.outcome_unknown("Session event history changed.")
+                            continue
+                        if type(sequence) is int:
+                            if sequence <= attachment.last_sequence:
+                                continue
+                            if sequence != attachment.last_sequence + 1:
+                                self.outcome_unknown("Session event history has a gap.")
+                                continue
+                            attachment.last_sequence = sequence
+                        attachment.update(params)
+                        if kind in ("session.updated", "session.info"):
+                            attachment.update(params.get("payload") or {})
                     old_question = self.state.clarify()
                     busy = self.state.busy
-                    self.state.event(kind, params.get("payload") or {})
+                    unknown = self.state.unknown
+                    payload = params.get("payload") or {}
+                    admission = params.get("admission_id") or payload.get("admission_id")
+                    self.state.event(kind, {**payload, **({"admission_id": admission} if admission else {})})
+                    if self.state.unknown and not unknown:
+                        self.outcome_unknown("Hermes has an unresolved submitted turn.")
                     if old_question and old_question is not self.state.clarify():
                         self.answer_draft = Draft()
-                    if busy and not self.state.busy and self.state.queued:
+                    if (
+                        kind == "message.complete"
+                        and busy
+                        and not self.state.busy
+                        and not self.state.unknown
+                        and self.state.ready
+                        and self.state.queued
+                    ):
                         held = self.state.take_queued()
                         if held:
                             self.submit(held)
@@ -206,70 +277,132 @@ class App:
         batch, self.pending = self.pending, []
         remaining = []
         for method, future, deadline in batch:
-            if not future.done():
-                if time.monotonic() > deadline:
-                    if method == "complete.slash":
-                        self.asked.pop(future, None)  # the list keeps this pane's own commands
-                    elif method == "session.resume" and self.switching:
-                        self.state.add("notice", f"Hermes did not pick up {self.switching!r} in time.")
-                        self.switching = None
-                    elif method in ("session.resume", "session.most_recent"):
-                        self.start_fresh(f"Hermes did not find {self.resume!r} in time")
-                    elif method in ("session.create", "client.capabilities"):
-                        self.fail(f"Timed out waiting for {method}.")
-                    else:
-                        self.state.add(
-                            "error", f"Hermes has not acknowledged {method}. Use Stop before retrying."
-                        )
-                    continue
+            params = self.request_params.get(future, {})
+            if not future.done() and time.monotonic() <= deadline:
                 remaining.append((method, future, deadline))
                 continue
+            mutation = self.mutations.pop(future, None)
+            self.request_params.pop(future, None)
+            if (
+                params.get("session_id")
+                and self.state.session_id
+                and method not in ("session.resume", "session.detach")
+                and params["session_id"] != self.state.session_id
+            ):
+                self.asked.pop(future, None)
+                continue
             try:
+                if not future.done():
+                    raise TimeoutError(f"Timed out waiting for {method}")
                 result = future.result()
                 if method == "client.capabilities":
-                    if self.resume == "latest":
-                        self.request("session.most_recent", self.profiled())
-                    elif self.resume:
-                        self.request("session.resume", self.profiled(session_id=self.resume, cols=self.cols))
+                    if self.resume:
+                        self.request_resume(self.resume)
                     else:
                         self.create_session()
-                elif method == "session.most_recent":
-                    if result.get("session_id"):
-                        self.request(
-                            "session.resume", self.profiled(session_id=result["session_id"], cols=self.cols)
-                        )
-                    else:
-                        self.start_fresh("There is no earlier session to continue")
                 elif method == "session.resume":
-                    previous = self.state.session_id if self.switching else None
-                    if previous:
+                    old = self.attachment
+                    if mutation:
+                        if params.get("session_id") != self.state.session_id:
+                            continue
+                        self.attachment = Attachment.snapshot(result)
+                        if self.state.unknown or (old and old.replay_epoch != self.attachment.replay_epoch):
+                            self.outcome_unknown("Resume the session before changing it.")
+                            continue
+                        if old and old.replay_epoch == self.attachment.replay_epoch:
+                            self.attachment.last_sequence = old.last_sequence
+                        old_question = self.state.clarify()
+                        self.state.snapshot(result, history=False)
+                        if old_question and old_question is not self.state.clarify():
+                            self.answer_draft = Draft()
+                        if self.state.unknown:
+                            self.outcome_unknown("Hermes has an unresolved submitted turn.")
+                            continue
+                        operation, payload = mutation
+                        if operation == "refresh":
+                            continue
+                        fences = {"expected_revision": self.attachment.revision}
+                        if operation == "model":
+                            fences["expected_generation"] = self.attachment.execution_generation
+                        self.request(
+                            "session.mutate",
+                            self.scoped(
+                                operation=operation, payload=payload, request_id=uuid4().hex, **fences
+                            ),
+                        )
+                        continue
+                    if self.switching:
                         self.state.switched()
                         self.state.close_sheet()
+                    else:
+                        self.state.clear()
+                        self.state.questions.clear()
+                        self.state.input_ids.clear()
                     self.switching = None
-                    self.session_ready(result, stored=result.get("session_key") or result.get("resumed"))
-                    self.state.restore(result.get("messages") or [], result.get("info") or {})
-                    if previous and previous != self.state.session_id:
-                        self.request("session.close", {"session_id": previous})
+                    self.resume_by_title = False
+                    self.session_ready(result)
+                    self.answer_draft = Draft()
+                    self.state.snapshot(result, history=True)
+                    if self.state.unknown:
+                        self.outcome_unknown("Hermes has an unresolved submitted turn.")
+                    if old and old.session_id != self.attachment.session_id:
+                        self.request(*old.farewell())
                 elif method == "session.list":
-                    self.state.listed(result.get("sessions") or [])
+                    scope = params.get("scope", "live")
+                    self.list_feeds[scope] = result.get("sessions") or []
+                    merged = {}
+                    for feed in ("stored", "live"):
+                        for row in self.list_feeds.get(feed, []):
+                            identity = row.get("resolved_id") or row.get("session_id") or row.get("id")
+                            if identity:
+                                merged[identity] = {**row, "id": identity}
+                    recent = sorted(merged.values(), key=lambda row: row.get("started_at") or 0, reverse=True)
+                    self.state.listed(recent[:SESSIONS])
                 elif method == "session.create":
-                    self.session_ready(result, stored=result.get("stored_session_id"))
+                    self.session_ready(result)
+                    self.state.snapshot(result, history=False)
+                    if self.state.unknown:
+                        self.outcome_unknown("Hermes has an unresolved submitted turn.")
                     if self.demo_duration is None:
-                        self.request("session.list", self.profiled(limit=SESSIONS))
-                    if self.demo_duration is not None:
+                        self.list_sessions()
+                    else:
                         self.submit(f"Run a {self.demo_duration:g}-second simulated visual demo.")
-                elif method == "session.interrupt":
-                    self.state.activity = "Stopping" if self.state.busy else "Ready"
+                elif method == "prompt.submit":
+                    admission = result.get("admission_id")
+                    if admission:
+                        self.state.receipts[admission] = result
+                        if self.state.turn.submission_id == params.get("submission_id"):
+                            self.state.turn.admission_id = admission
+                    if result.get("status") == "unknown":
+                        self.outcome_unknown("Hermes reported an unknown turn outcome.")
+                    if self.attachment:
+                        self.attachment.update(result)
+                elif method in ("session.interrupt", "session.mutate"):
+                    if self.attachment:
+                        self.attachment.update(result)
+                    if method == "session.mutate":
+                        self.state.event("session.updated", result)
+                        if params.get("operation") == "model":
+                            self.model_set(result)
+                    else:
+                        self.state.activity = "Stopping" if self.state.busy else "Ready"
+                        self.state.touch()
+                elif method in ("approval.respond", "clarify.respond"):
+                    old_question = self.state.clarify()
+                    rid = str(result.get("prompt_id") or params.get("prompt_id"))
+                    question = self.state.questions.get(rid)
+                    if question and question.generation == params.get("execution_generation"):
+                        self.state.questions.pop(rid)
+                    if old_question and old_question is not self.state.clarify():
+                        self.answer_draft = Draft()
                     self.state.touch()
                 elif method == "model.options":
                     self.state.models = result
                     self.state.touch()
                 elif method == "config.set":
-                    self.model_set(result)
-                elif method == "session.title":
-                    if result.get("title"):
-                        self.state.title = str(result["title"])
-                        self.state.touch()
+                    if self.attachment:
+                        refresh = self.request("session.resume", {"session_id": self.attachment.session_id})
+                        self.mutations[refresh] = ("refresh", {})
                 elif method == "subagent.tail":
                     self.state.watch_tail(result)
                 elif method in ("subagent.interrupt", "subagent.steer"):
@@ -288,42 +421,71 @@ class App:
                 elif method in ("slash.exec", "command.dispatch"):
                     command = self.asked.pop(future, "")
                     self.state.add("notice", f"{command.split(' ')[0]}: {exc}")
-                elif method == "session.resume" and self.switching:
-                    self.state.add("notice", f"Could not resume {self.switching!r}: {exc}")
-                    self.switching = None
-                elif method in ("session.resume", "session.most_recent"):
-                    self.start_fresh(f"Could not resume {self.resume!r}: {exc}")
-                elif method in ("session.list", "session.close"):
-                    pass  # the welcome and the sheet simply offer nothing; a close is best effort
+                elif method == "prompt.submit" and not hasattr(exc, "code"):
+                    self.outcome_unknown("Hermes did not acknowledge the submitted turn.")
+                elif method == "session.resume" and not mutation:
+                    target = self.switching or self.resume
+                    reason = getattr(exc, "data", {}).get("reason") or str(exc)
+                    if reason == "not_found" and target != "latest" and not self.resume_by_title:
+                        self.resume_by_title = True
+                        self.request("session.resume", {"title": target, "display_projection": True})
+                    elif self.state.session_id:
+                        self.state.add("notice", f"Could not resume {target!r}: {exc}")
+                        self.switching = None
+                        self.resume_by_title = False
+                    elif reason == "not_found":
+                        self.start_fresh(f"Could not resume {target!r}: {exc}")
+                    else:
+                        self.fail(f"Could not resume {target!r}: {exc}")
+                elif method in ("session.list", "session.detach"):
+                    pass
                 elif method in ("client.capabilities", "session.create"):
                     self.fail(str(exc))
                 else:
                     self.state.add("error", str(exc))
-                    if method == "prompt.submit":
-                        self.state.busy = False
-                        self.state.activity = "Ready"
-        # Requests scheduled by the handlers above must survive this iteration.
+                    if (
+                        method == "prompt.submit"
+                        and self.state.turn.submission_id == params.get("submission_id")
+                        and self.state.turn.admission_id is None
+                        and not self.state.unknown
+                    ):
+                        self.state.turn = Turn()
+                        self.state.activity = "Waiting" if self.state.busy else "Ready"
         self.pending = remaining + self.pending
 
-    @property
-    def cols(self) -> int:
-        return self.session.caps.cols or 80
-
-    def profiled(self, **params) -> dict:
-        """Params for a call that reaches Hermes's session store, in the launch profile's home."""
-        profile = self.options.get("profile")
-        return {**params, **({"profile": profile} if profile else {})}
-
     def create_session(self) -> None:
-        params = {
-            "cwd": str(self.cwd),
-            "cwd_explicit": True,
-            "source": "tui",
-            "title": "Hermes for Tern",
-            "cols": self.cols,
-            **self.options,
-        }
+        params = {"source": "tui", "request_id": uuid4().hex, **self.options}
+        if self.session_cwd is not None:
+            params.update(cwd=self.session_cwd, cwd_explicit=True)
         self.request("session.create", params)
+
+    def request_resume(self, target: str) -> None:
+        params = {"display_projection": True}
+        if target == "latest":
+            params["latest"] = "tui"
+            if self.session_cwd is not None:
+                params["workspace"] = self.session_cwd
+        else:
+            params["session_id"] = target
+        self.request("session.resume", params)
+
+    def list_sessions(self) -> None:
+        self.list_feeds.clear()
+        for scope in ("live", "stored"):
+            self.request("session.list", {"scope": scope, "limit": SESSIONS})
+
+    def outcome_unknown(self, message: str) -> None:
+        if self.state.turn.phase != "disconnected":
+            self.state.turn.phase = "unknown"
+        self.state.activity = "Outcome unknown"
+        hint = self.resume_hint() or f"Resume {self.state.session_id or 'the session'} to inspect it."
+        self.state.add("error", f"{message} Turn outcome is unknown. Do not resend the work. {hint}")
+
+    def submit_prompt(self, text: str) -> None:
+        identity = uuid4().hex
+        self.state.input_ids.add(identity)
+        self.state.turn.submission_id = identity
+        self.request("prompt.submit", self.scoped(text=text, submission_id=identity, clarify_batch=True))
 
     def start_fresh(self, why: str) -> None:
         """A resume that could not happen starts a new session instead of leaving the pane dead."""
@@ -331,9 +493,10 @@ class App:
         self.resume = None
         self.create_session()
 
-    def session_ready(self, result: dict, *, stored: str | None) -> None:
-        self.state.session_id = result["session_id"]
-        self.state.stored_session_id = stored
+    def session_ready(self, result: dict) -> None:
+        self.attachment = Attachment.snapshot(result)
+        self.state.session_id = self.attachment.session_id
+        self.state.stored_session_id = result["stored_session_id"]
         self.state.info.update(result.get("info") or {})
         self.state.ready = True
         self.state.activity = "Ready"
@@ -345,11 +508,16 @@ class App:
         stored = self.state.stored_session_id
         if not stored or not (self.state.last_prompt or self.state.resumed):
             return ""
-        profile = self.options.get("profile")
-        flag = f" -p {profile}" if profile and profile not in ("default", "custom") else ""
-        lines = ["Resume this session with:", f"  hermes --resume {stored}{flag}"]
+        flags = ["-p", self.profile] if self.profile else []
+        if self.gateway:
+            flags.extend(["--gateway-hermes", self.gateway.hermes])
+            if self.gateway.host:
+                flags.extend(["--gateway-host", self.gateway.host])
+            if self.gateway.cwd:
+                flags.extend(["--gateway-cwd", self.gateway.cwd])
+        lines = ["Resume this session with:", "  " + shlex.join(["hermes", "--resume", stored, *flags])]
         if self.state.title:
-            lines.append(f'  hermes -c "{self.state.title}"{flag}')
+            lines.append("  " + shlex.join(["hermes", "-c", self.state.title, *flags]))
         return "\n".join(lines)
 
     def server_request(self, frame: dict) -> None:
@@ -357,13 +525,11 @@ class App:
         rid, method, params = str(frame["id"]), frame["method"], frame.get("params") or {}
         if params.get("session_id") != self.state.session_id:
             self.backend.answer(rid, error={"code": -32601, "message": "Session is not displayed here"})
-        elif method in ("approval", "clarify"):
-            if method == "clarify" and not params.get("questions"):
+        elif method == "clarify":
+            if not params.get("questions"):
                 self.backend.answer(rid, {"answers": {}})
                 return
             self.state.questions[rid] = Question(rid, method, params)
-            if method == "approval":
-                self._ack_approvals.append(rid)
             self.state.touch()
         elif method in SECRET_METHODS:
             # A one-string ask: a password, a key or a code. It is answered from the composer,
@@ -383,9 +549,10 @@ class App:
         question = self.state.questions.get(rid)
         if not question or choice not in (question.params.get("choices") or ["deny"]):
             return
-        self.backend.answer(rid, {"choice": choice})
-        self.state.questions.pop(rid, None)
-        self.state.add("notice", "Permission denied" if choice == "deny" else "Permission granted")
+        self.request(
+            "approval.respond",
+            self.scoped(prompt_id=rid, choice=choice, execution_generation=question.generation),
+        )
 
     def choose(self, rid: str, choice: str | None) -> None:
         question = self.state.questions.get(rid)
@@ -417,6 +584,14 @@ class App:
 
     def answer_question(self, question: Question, answer: str | None) -> None:
         assert self.backend
+        if question.generation is not None:
+            self.request(
+                "clarify.respond",
+                self.scoped(
+                    prompt_id=question.rid, answer=answer or "", execution_generation=question.generation
+                ),
+            )
+            return
         question.answers[question.current["qid"]] = answer
         question.index += 1
         question.selected.clear()
@@ -427,8 +602,10 @@ class App:
         self.state.touch()
 
     def stop(self) -> None:
-        if self.state.busy and self.state.session_id:
-            self.request("session.interrupt", self.scoped())
+        if self.state.busy and self.attachment and not self.state.unknown:
+            self.request(
+                "session.interrupt", self.scoped(execution_generation=self.attachment.execution_generation)
+            )
             self.state.activity = "Stopping"
             self.state.touch()
 
@@ -507,22 +684,35 @@ class App:
             self.switch_model(chosen)
 
     def switch_model(self, value: str, *, confirmed: bool = False) -> None:
-        """Ask Hermes to run another model. Mid-turn it holds the pick for the next turn start and
-        reports it in session.info; an expensive model asks first, which is what `confirmed` is."""
-        if not value or not self.state.session_id:
+        if not value or not self.attachment:
             return
-        if self.state.sheet:
-            # The sheet's row is the pending pick, so a confirmation repeats the same one.
-            self.state.choose_row(value)
-        params: dict = {"key": "model", "value": value}
+        payload = {"model": value}
+        for row in model_rows(self.state):
+            if row["id"] == value:
+                provider = next(
+                    provider
+                    for provider in self.state.models["providers"]
+                    if str(provider.get("name") or provider.get("slug") or "") == row["detail"]
+                )
+                payload = {"model": row["label"], "provider": provider["slug"]}
+                break
         if confirmed:
-            params["confirm_expensive_model"] = True
-        self.request("config.set", self.scoped(**params))
+            if not self.state.sheet or not self.state.sheet.confirm:
+                return
+            payload["confirm"] = self.state.sheet.confirm
+        if self.state.sheet:
+            self.state.choose_row(value)
+        self.mutate("model", payload)
+
+    def mutate(self, operation: str, payload: dict) -> None:
+        if not self.attachment or self.state.unknown:
+            return
+        future = self.request("session.resume", {"session_id": self.attachment.session_id})
+        self.mutations[future] = (operation, payload)
 
     def rename_session(self, title: str) -> None:
-        """Name this session; Hermes owns the title and echoes it back on `session.title`."""
-        if title and self.state.session_id:
-            self.request("session.title", self.scoped(title=title))
+        if title:
+            self.mutate("rename", {"title": title})
 
     def side_question(self, text: str) -> None:
         """Ask Hermes something beside the work it is doing; the answer lands as a dispatch."""
@@ -657,19 +847,16 @@ class App:
             self.state.add("notice", detail[:200] or "The child will not take that.")
 
     def model_set(self, result: dict) -> None:
-        """Hermes answered a model switch: either it asks whether the expensive pick is worth it,
-        or it holds the pick for the next turn because this one is still running."""
         if result.get("confirm_required"):
             if self.state.sheet:
                 self.state.sheet.confirming = True
+                self.state.sheet.confirm = result.get("confirm")
             self.state.add(
                 "notice",
                 str(result.get("confirm_message") or "Hermes asks whether this model is worth it."),
             )
             return
         self.state.close_sheet()
-        if result.get("deferred"):
-            self.state.dispatch("model", "model switches when this turn ends", str(result.get("value") or ""))
         if result.get("warning"):
             self.state.add("notice", str(result["warning"]))
 
@@ -683,7 +870,7 @@ class App:
         if self.state.can_retry:
             prompt = self.state.last_prompt
             self.state.begin(prompt)
-            self.request("prompt.submit", self.scoped(text=prompt))
+            self.submit_prompt(prompt)
 
     def submit(self, text: str | None = None) -> None:
         question = self.state.secret()
@@ -707,7 +894,7 @@ class App:
             if text.strip() != "/stop":
                 self.draft = Draft()
             return
-        if not self.state.ready or self.state.failed:
+        if not self.state.ready or self.state.failed or self.state.unknown:
             return
         if self.state.busy:
             # Hermes is still working; hold the thought rather than dropping it on the floor.
@@ -716,7 +903,7 @@ class App:
             return
         self.state.begin(text)
         self.draft = Draft()
-        self.request("prompt.submit", self.scoped(text=text))
+        self.submit_prompt(text)
 
     def run_command(self, text: str) -> None:
         """One of COMMANDS, answered here; every other `/command` is Hermes's to run."""
@@ -728,7 +915,34 @@ class App:
         elif text == "/model":
             self.model_event("open")
         elif text.startswith("/model "):
-            self.switch_model(text[len("/model ") :].strip())
+            raw = text[len("/model ") :].strip()
+            try:
+                parts = shlex.split(raw)
+            except ValueError as exc:
+                self.state.add("error", str(exc))
+                return
+            if "--provider" in parts or any(part.startswith("--provider=") for part in parts):
+                provider = None
+                models = []
+                index = 0
+                while index < len(parts):
+                    part = parts[index]
+                    if part == "--provider" and index + 1 < len(parts):
+                        index += 1
+                        provider = parts[index]
+                    elif part.startswith("--provider="):
+                        provider = part.partition("=")[2]
+                    else:
+                        models.append(part)
+                    index += 1
+                if provider and len(models) == 1 and not models[0].startswith("-"):
+                    self.mutate("model", {"model": models[0], "provider": provider})
+                else:
+                    self.hermes_command(text)
+            elif any(part.startswith("--") for part in parts):
+                self.hermes_command(text)
+            else:
+                self.switch_model(raw)
         elif text == "/resume":
             self.open_sessions()
         elif text.startswith("/resume "):
@@ -762,23 +976,22 @@ class App:
         """The sessions sheet, filled from Hermes's store as soon as it answers."""
         if not self.state.session_id:
             return
-        self.request("session.list", self.profiled(limit=SESSIONS))
+        self.list_sessions()
         self.state.open_sheet("sessions")
 
     def resume_session(self, target: str) -> None:
-        """Pick up an earlier session in this pane: its transcript replaces this one, and this live
-        session is closed in Hermes once the other is open (its history stays in Hermes's store)."""
         if not target or not self.state.session_id or self.switching:
             return
-        if self.state.busy:
+        if self.state.busy and not self.state.unknown:
             self.state.add("notice", "Finish or stop this turn before switching sessions.")
             return
-        if target == self.state.stored_session_id:
+        if target in (self.state.stored_session_id, self.state.session_id) and not self.state.unknown:
             self.state.close_sheet()
             self.state.add("notice", "This is the session you are in.")
             return
         self.switching = target
-        self.request("session.resume", self.profiled(session_id=target, cols=self.cols))
+        self.resume_by_title = False
+        self.request_resume(target)
 
     def hermes_command(self, text: str) -> None:
         """Hand a slash command to Hermes, the way its own terminal does: `slash.exec` first, which
@@ -833,26 +1046,27 @@ class App:
     def send_command(self, message: str, shown: str) -> None:
         """Send what a command expanded to, showing the command as it was typed rather than the
         expansion, which is written for the model."""
-        if self.state.busy:
+        if self.state.busy or self.state.unknown or not self.state.ready or self.state.failed:
             self.state.add("notice", f"{shown.split(' ')[0]} can run when this turn ends.")
             return
         self.state.begin(shown)
         self.state.last_prompt = message
-        self.request("prompt.submit", self.scoped(text=message))
+        self.submit_prompt(message)
 
     def doctor(self) -> None:
         """What `--doctor` prints on the terminal, said here so it is never a dead end."""
         from . import launcher
 
         lines = []
+        config = {}
         try:
             config = launcher.settings()
-            original = launcher.original_command(config)
+            original = self.gateway.hermes if self.gateway else launcher.original_command(config)
             lines.append(("hermes", original))
-            lines.append(("backend", shlex.join(launcher.backend_command(original, config))))
-            lines.append(("wrapper", str(config.get("target", "not installed"))))
         except (OSError, RuntimeError, ValueError) as exc:
             lines.append(("launcher", str(exc)))
+        lines.append(("gateway", self.gateway.describe() if self.gateway else "demo"))
+        lines.append(("wrapper", str(config.get("target", "not installed"))))
         lines.append(("protocol", str(getattr(tern_sdk.wire, "VERSION", "?"))))
         lines.append(("session", self.state.session_id or "none"))
         lines.append(("project", str(self.cwd)))

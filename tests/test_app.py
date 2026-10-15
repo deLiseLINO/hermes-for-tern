@@ -1,4 +1,5 @@
 import queue
+import shlex
 from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,8 +8,7 @@ from tern_sdk import Key
 
 from hermes_for_tern.app import App
 from hermes_for_tern.editor import Draft
-from hermes_for_tern.state import QUEUE, Conversation, Question
-from hermes_for_tern.views import sheet_rows
+from hermes_for_tern.state import QUEUE, Attachment, Conversation, Question
 
 
 class FakeBackend:
@@ -26,9 +26,28 @@ class FakeBackend:
         self.answers.append((rid, result, kwargs))
 
 
+def snapshot(session_id="live", stored="stored", **changes):
+    return {
+        "session_id": session_id,
+        "stored_session_id": stored,
+        "subscription_id": "viewer-" + session_id,
+        "revision": 7,
+        "execution_generation": 3,
+        "replay_epoch": "epoch",
+        "last_sequence": 0,
+        "running": False,
+        "pending": [],
+        "prompts": [],
+        "info": {},
+        "display_messages": [],
+        **changes,
+    }
+
+
 def app():
     instance = App(SimpleNamespace(caps=SimpleNamespace(cols=100)), [], Path("/project"), {})
     instance.backend = FakeBackend()
+    instance.attachment = Attachment.snapshot(snapshot())
     return instance
 
 
@@ -38,28 +57,33 @@ def test_startup_schedules_session_creation_without_losing_its_future():
     instance.backend.requests[-1][2].set_result({"server_requests": ["approval", "clarify"]})
     instance.check_requests()
     assert instance.pending[0][0] == "session.create"
-    instance.backend.requests[-1][2].set_result(
-        {"session_id": "live", "stored_session_id": "stored", "info": {}}
-    )
+    instance.backend.requests[-1][2].set_result(snapshot())
     instance.check_requests()
     assert instance.state.session_id == "live"
     assert instance.state.ready
 
 
-def test_approval_can_only_send_an_offered_choice_with_original_rpc_id():
+def test_approval_only_sends_an_offered_choice_and_waits_for_owner_settlement():
     instance = app()
     instance.state.session_id = "live"
-    instance.server_request(
-        {
-            "id": "srq-1",
-            "method": "approval",
-            "params": {"session_id": "live", "request_id": "approval-1", "choices": ["once", "deny"]},
-        }
+    instance.state.event(
+        "approval.request",
+        {"kind": "approval", "prompt_id": "a", "execution_generation": 3, "choices": ["once", "deny"]},
     )
-    instance.approve("srq-1", "always")
-    assert not instance.backend.answers
-    instance.approve("srq-1", "once")
-    assert instance.backend.answers == [("srq-1", {"choice": "once"}, {})]
+    instance.approve("a", "always")
+    assert not instance.backend.requests and not instance.backend.answers
+    instance.approve("a", "once")
+    assert instance.backend.requests[-1][:2] == (
+        "approval.respond",
+        {
+            "session_id": "live",
+            "prompt_id": "a",
+            "choice": "once",
+            "execution_generation": 3,
+        },
+    )
+    assert "a" in instance.state.questions
+    settled(instance, {"prompt_id": "a", "status": "resolved"})
     assert not instance.state.questions
 
 
@@ -91,49 +115,39 @@ def test_unsupported_request_fails_promptly_and_busy_submit_is_held():
     assert instance.backend.answers[0][2]["error"]["code"] == -32601
     assert instance.state.rows[-1].text.startswith("This frontend does not support tour")
     instance.state.ready = True
-    instance.state.busy = True
+    instance.state.begin("work")
     instance.submit("Do something")
     assert not instance.backend.requests
 
 
 def pending_approval(instance, choices=("once", "session", "always", "deny")):
     instance.state.session_id = "live"
-    instance.server_request(
-        {
-            "id": "srq-k",
-            "method": "approval",
-            "params": {"session_id": "live", "request_id": "a-1", "choices": list(choices)},
-        }
+    instance.state.event(
+        "approval.request",
+        {"kind": "approval", "prompt_id": "a-1", "choices": list(choices), "execution_generation": 3},
     )
-    return "srq-k"
+    return "a-1"
 
 
 def test_a_pending_approval_answers_to_digits_enter_and_escape():
-    instance = app()
-    rid = pending_approval(instance)
-    instance.input(Key(name="3"))
-    assert instance.backend.answers[-1] == (rid, {"choice": "always"}, {})
-    assert not instance.state.questions
-
-    rid = pending_approval(instance)
-    instance.input(Key(name="enter"))
-    assert instance.backend.answers[-1] == (rid, {"choice": "once"}, {})
-
-    rid = pending_approval(instance)
-    instance.input(Key(name="escape"))
-    assert instance.backend.answers[-1] == (rid, {"choice": "deny"}, {})
+    for key, expected in (("3", "always"), ("enter", "once"), ("escape", "deny")):
+        instance = app()
+        pending_approval(instance)
+        instance.input(Key(name=key))
+        assert instance.backend.requests[-1][1]["choice"] == expected
+        assert not instance.backend.answers
 
 
 def test_a_digit_past_the_last_choice_is_ordinary_typing_and_esc_denies_the_ask():
     instance = app()
     instance.state.session_id = "live"
     instance.state.ready = True
-    rid = pending_approval(instance, choices=("once", "deny"))
+    pending_approval(instance, choices=("once", "deny"))
     instance.input(Key(name="7", text="7"))
     assert not instance.backend.answers
     assert instance.draft.text == "7"
     instance.input(Key(name="escape"))
-    assert instance.backend.answers == [(rid, {"choice": "deny"}, {})]
+    assert instance.backend.requests[-1][1]["choice"] == "deny"
 
 
 def test_clarification_digits_pick_a_choice_until_the_answer_draft_has_text():
@@ -243,7 +257,6 @@ def test_the_model_command_asks_hermes_for_its_catalog_once_and_opens_the_sheet(
     assert instance.state.sheet is not None
     assert instance.backend.requests[-1][0] == "model.options"
     settled(instance, CATALOG)
-    assert instance.state.models is CATALOG
     # the sheet is already open, so a second press only refreshes it
     instance.model_event("open")
     assert [method for method, *_ in instance.backend.requests].count("model.options") == 2
@@ -266,71 +279,53 @@ def test_typing_while_the_sheet_is_open_filters_it_instead_of_the_composer():
     assert instance.state.sheet is None
 
 
-def test_enter_switches_the_row_the_cursor_sits_on_and_arrows_move_it():
+def test_model_sheet_selection_refreshes_authority_before_mutating():
     instance = app()
     ready(instance)
     instance.state.models = CATALOG
     instance.state.info = {"model": "claude-sonnet-4", "provider": "anthropic"}
     instance.model_event("open")
-    assert [row["id"] for row in sheet_rows(instance.state)] == [
-        "anthropic/claude-sonnet-4",
-        "claude-haiku-4",
-        "gpt-5",
-        "copilot/claude-sonnet-4",
-    ]
     instance.confirm_model()
+    settled(instance, snapshot(revision=12, execution_generation=8))
     method, params, _ = instance.backend.requests[-1]
-    # two providers carry this name, so its value names the one this session is on
-    assert method == "config.set" and params["value"] == "anthropic/claude-sonnet-4"
-    instance.input(Key(name="down"))
-    instance.confirm_model()
-    assert instance.backend.requests[-1][1]["value"] == "claude-haiku-4"
-    instance.input(Key(name="up"))
-    instance.input(Key(name="up"))
-    instance.confirm_model()
-    assert instance.backend.requests[-1][1]["value"] == "anthropic/claude-sonnet-4"
+    assert method == "session.mutate"
+    assert params["payload"] == {"model": "claude-sonnet-4", "provider": "anthropic"}
+    assert params["expected_revision"] == 12 and params["expected_generation"] == 8
+    assert params["request_id"]
 
 
-def test_an_expensive_model_asks_before_switching():
+def test_an_expensive_model_preserves_the_owners_confirmation_token():
     instance = app()
     ready(instance)
-    instance.state.models = CATALOG
-    instance.state.info = {"model": "gpt-5", "provider": "openai"}
     instance.model_event("open")
     instance.switch_model("anthropic/claude-sonnet-4")
-    settled(instance, {"confirm_required": True, "confirm_message": "This model is expensive."})
+    settled(instance, snapshot(revision=10, execution_generation=4))
+    settled(
+        instance,
+        {
+            "status": "confirmation_required",
+            "confirm_required": True,
+            "confirm": "owner-token",
+            "confirm_message": "This model is expensive.",
+        },
+    )
     assert instance.state.sheet.confirming
     assert instance.state.rows[-1].text == "This model is expensive."
     instance.confirm_model()
-    method, params, _ = instance.backend.requests[-1]
-    assert method == "config.set" and params["confirm_expensive_model"] is True
+    settled(instance, snapshot(revision=11, execution_generation=5))
+    params = instance.backend.requests[-1][1]
+    assert params["payload"] == {"model": "anthropic/claude-sonnet-4", "confirm": "owner-token"}
+    assert params["expected_revision"] == 11 and params["expected_generation"] == 5
 
 
-def test_a_switch_mid_turn_is_held_for_the_next_turn_and_says_so():
+def test_a_stale_model_mutation_is_visible_and_never_retried():
     instance = app()
     ready(instance)
-    instance.state.begin("work")
-    instance.state.models = CATALOG
-    instance.state.info = {"model": "gpt-5", "provider": "openai"}
-    instance.model_event("open")
-    instance.switch_model("anthropic/claude-sonnet-4")
-    settled(instance, {"value": "anthropic/claude-sonnet-4", "deferred": True})
-    assert instance.state.sheet is None
-    assert [d.text for d in instance.state.dispatches] == ["model switches when this turn ends"]
-
-
-def test_a_row_pick_switches_straight_away():
-    instance = app()
-    ready(instance)
-    instance.state.models = CATALOG
-    instance.state.info = {"model": "gpt-5", "provider": "openai"}
-    instance.model_event("open")
-    instance.model_event("pick", "anthropic/claude-sonnet-4")
-    assert instance.backend.requests[-1][1]["value"] == "anthropic/claude-sonnet-4"
-    instance.state.sheet = None
-    instance.model_event("open")
-    instance.model_event("pick", "copilot/claude-sonnet-4")
-    assert instance.backend.requests[-1][1]["value"] == "copilot/claude-sonnet-4"
+    instance.switch_model("gpt-5")
+    settled(instance, snapshot())
+    answer(instance, "session.mutate", error={"code": 4001, "message": "stale_generation"})
+    assert instance.state.rows[-1].text == "stale_generation"
+    assert [method for method, _, _ in instance.backend.requests].count("session.mutate") == 1
 
 
 def test_a_masked_ask_is_answered_from_the_composer_and_never_shown():
@@ -466,27 +461,27 @@ def built_nodes(instance):
     return View.build(tree).nodes().values()
 
 
-def test_the_session_can_be_named_and_hermes_names_it_back():
+def test_rename_uses_refreshed_revision_and_owner_update():
     instance = app()
-    instance.state.session_id = "live"
+    ready(instance)
     instance.rename_session("Hunting a flaky test")
+    settled(instance, snapshot(revision=19))
     method, params, _ = instance.backend.requests[-1]
-    assert method == "session.title" and params["title"] == "Hunting a flaky test"
-    settled(instance, {"title": "Hunting a flaky test", "session_key": "stored"})
-    assert instance.state.title == "Hunting a flaky test"
-    # and the auto-titler's own rename arrives as an event
-    instance.backend.events.put(
+    assert method == "session.mutate"
+    assert params["operation"] == "rename" and params["payload"] == {"title": "Hunting a flaky test"}
+    assert params["expected_revision"] == 19 and "expected_generation" not in params
+    settled(
+        instance,
         {
-            "method": "event",
-            "params": {
-                "session_id": "live",
-                "type": "session.title",
-                "payload": {"session_id": "stored", "title": "Tern surface polish"},
-            },
-        }
+            "session_id": "live",
+            "revision": 20,
+            "execution_generation": 3,
+            "operation": "rename",
+            "title": "Hunting a flaky test",
+        },
     )
-    instance.read_backend()
-    assert instance.state.title == "Tern surface polish"
+    assert instance.state.title == "Hunting a flaky test"
+    assert instance.attachment.revision == 20
 
 
 def test_a_held_follow_up_can_be_taken_back():
@@ -594,10 +589,8 @@ def test_this_panes_commands_run_here_and_ones_needing_an_argument_wait_for_it()
     instance.run_command("/cost")
     instance.run_command("/clear")
     instance.run_command("/title Flaky test hunt")  # Hermes's spelling of /name
-    assert instance.backend.requests[-1][:2] == (
-        "session.title",
-        {"session_id": "live", "title": "Flaky test hunt"},
-    )
+    settled(instance, snapshot())
+    assert instance.backend.requests[-1][1]["payload"] == {"title": "Flaky test hunt"}
     instance.run_command("/exit")
     assert instance.exit
 
@@ -626,10 +619,9 @@ def test_skills_go_through_command_dispatch_and_send_what_they_expand_to():
         "command.dispatch",
         {"type": "skill", "name": "work", "message": "SKILL BODY", "display": "/work fix the leak"},
     )
-    assert instance.backend.requests[-1][:2] == (
-        "prompt.submit",
-        {"session_id": "live", "text": "SKILL BODY"},
-    )
+    method, params, _ = instance.backend.requests[-1]
+    assert method == "prompt.submit" and params["text"] == "SKILL BODY"
+    assert params["submission_id"] and params["clarify_batch"] is True
     # the transcript shows the command as typed, not the expansion written for the model
     assert instance.state.rows[-1].kind == "user" and instance.state.rows[-1].text == "/work fix the leak"
 
@@ -658,58 +650,52 @@ def resuming_app(**options):
     return instance
 
 
-STORED = {
-    "session_id": "live-2",
-    "session_key": "20261011_abc",
-    "info": {"title": "Flaky test hunt", "model": "m"},
-    "messages": [
+STORED = snapshot(
+    session_id="live-2",
+    stored="20261011_abc",
+    info={"title": "Flaky test hunt", "model": "m"},
+    display_messages=[
         {"role": "user", "text": "Why does CI fail?"},
         {"role": "assistant", "text": "Let me look."},
         {"role": "tool", "name": "terminal", "context": "uv run pytest -q"},
         {"role": "assistant", "text": "The fixture closes the pipe early."},
     ],
-}
+)
 
 
 def test_resume_picks_up_the_stored_session_and_redraws_it():
     instance = resuming_app(resume="20261011_abc")
     assert instance.backend.requests[-1][:2] == (
         "session.resume",
-        {"session_id": "20261011_abc", "cols": 100},
+        {"session_id": "20261011_abc", "display_projection": True},
     )
     answer(instance, "session.resume", STORED)
     state = instance.state
     assert state.session_id == "live-2" and state.stored_session_id == "20261011_abc" and state.ready
     assert [row.kind for row in state.rows] == ["user", "assistant", "tool", "assistant", "notice"]
     assert state.rows[2].target == "uv run pytest -q" and state.rows[2].status == "done"
-    assert state.rows[-1].text == "Resumed “Flaky test hunt” · 3 messages before this."
-    assert instance.resume_hint() == (
-        'Resume this session with:\n  hermes --resume 20261011_abc\n  hermes -c "Flaky test hunt"'
-    )
 
 
-def test_continue_takes_the_newest_session_and_a_missing_one_starts_fresh():
+def test_continue_asks_owner_for_latest_and_only_not_found_starts_fresh():
     instance = resuming_app(continue_last=True, profile="work")
-    assert instance.backend.requests[-1][:2] == ("session.most_recent", {"profile": "work"})
-    answer(instance, "session.most_recent", {"session_id": "20261010_xyz"})
-    assert instance.backend.requests[-1][1]["session_id"] == "20261010_xyz"
-    answer(instance, "session.resume", error={"code": 4007, "message": "session not found"})
+    assert instance.backend.requests[-1][:2] == (
+        "session.resume",
+        {"latest": "tui", "workspace": "/project", "display_projection": True},
+    )
+    answer(instance, "session.resume", error={"code": 4001, "message": "not_found"})
     assert instance.backend.requests[-1][0] == "session.create"
-    assert "session.create" != instance.backend.requests[-1][1].get("resume")  # no resume flag leaks in
     assert "This is a new session." in instance.state.rows[-1].text
-
-    nothing = resuming_app(continue_last=True)
-    answer(nothing, "session.most_recent", {"session_id": None})
-    assert nothing.backend.requests[-1][0] == "session.create"
+    broken = resuming_app(continue_last=True)
+    broken.backend.requests[-1][2].set_exception(BrokenPipeError("lost"))
+    broken.check_requests()
+    assert broken.state.failed
+    assert not any(method == "session.create" for method, _, _ in broken.backend.requests)
 
 
 def test_a_session_that_never_spoke_leaves_no_resume_hint():
     instance = ready_app()
     instance.state.stored_session_id = "20261011_new"
     assert instance.resume_hint() == ""
-    instance.state.begin("hello")
-    instance.options["profile"] = "work"
-    assert instance.resume_hint() == "Resume this session with:\n  hermes --resume 20261011_new -p work"
 
 
 def test_one_ctrl_c_never_leaves_two_in_a_row_do():
@@ -728,7 +714,7 @@ def test_one_ctrl_c_never_leaves_two_in_a_row_do():
     assert instance.backend.requests[-1][0] == "session.interrupt" and not instance.exit
     instance.state.pace(time.monotonic() + 3)
     assert instance.state.exit_armed is None
-    instance.state.busy = False  # the turn has ended
+    event(instance, "message.complete", {"status": "interrupted"})
     instance.draft = Draft("half a thought", 14)
     instance.input(Key(name="c", ctrl=True))
     assert instance.draft.text == "" and not instance.exit
@@ -753,32 +739,42 @@ def switching_app():
     instance = ready_app()
     instance.state.stored_session_id = "20261011_now"
     instance.state.begin("hello")
-    instance.state.busy = False
+    event(instance, "message.complete", {})
     return instance
 
 
 def test_resume_lists_sessions_and_picks_one_up_in_place():
     instance = switching_app()
+    instance.state.info["project"] = "old project"
     instance.run_command("/resume")
     assert instance.state.sheet.kind == "sessions"
-    assert instance.backend.requests[-1][:2] == ("session.list", {"limit": 50})
+    assert {
+        params["scope"] for method, params, _ in instance.backend.requests if method == "session.list"
+    } == {"live", "stored"}
     answer(instance, "session.list", LISTED)
     instance.input(Key(name="enter"))  # the newest session other than this one
-    assert instance.backend.requests[-1][:2] == ("session.resume", {"session_id": "20261010_ci", "cols": 100})
+    assert instance.backend.requests[-1][:2] == (
+        "session.resume",
+        {"session_id": "20261010_ci", "display_projection": True},
+    )
     answer(instance, "session.resume", STORED)
     state = instance.state
     assert state.sheet is None and state.session_id == "live-2" and state.stored_session_id == "20261011_abc"
+    assert "project" not in state.info
     assert [row.kind for row in state.rows][0] == "user" and state.rows[0].text == "Why does CI fail?"
     assert "hello" not in [row.text for row in state.rows]  # the old transcript is gone
-    assert instance.backend.requests[-1][:2] == ("session.close", {"session_id": "live"})
+    assert instance.backend.requests[-1][:2] == (
+        "session.detach",
+        {"session_id": "live", "subscription_id": "viewer-live"},
+    )
 
 
 def test_resume_refuses_mid_turn_and_says_when_you_are_already_there():
     instance = switching_app()
-    instance.state.busy = True
+    instance.state.begin("work")
     instance.run_command("/resume 20261010_ci")
     assert instance.state.rows[-1].text == "Finish or stop this turn before switching sessions."
-    instance.state.busy = False
+    event(instance, "message.complete", {})
     instance.run_command("/resume 20261011_now")
     assert instance.state.rows[-1].text == "This is the session you are in."
     instance.run_command("/sessions")  # Hermes's spelling
@@ -788,7 +784,7 @@ def test_resume_refuses_mid_turn_and_says_when_you_are_already_there():
 def test_a_failed_switch_leaves_this_session_as_it_was():
     instance = switching_app()
     instance.run_command("/resume nowhere")
-    answer(instance, "session.resume", error={"code": 4007, "message": "session not found"})
+    answer(instance, "session.resume", error={"code": 4001, "message": "permission_denied"})
     assert instance.state.session_id == "live" and instance.state.rows[0].text == "hello"
     assert "Could not resume 'nowhere'" in instance.state.rows[-1].text
     assert not any(method == "session.create" for method, _, _ in instance.backend.requests)
@@ -800,8 +796,10 @@ def test_a_new_session_offers_the_last_one_on_the_welcome():
     from hermes_for_tern.views import view
 
     instance = resuming_app()
-    answer(instance, "session.create", {"session_id": "live", "stored_session_id": "20261011_now"})
-    assert instance.backend.requests[-1][:2] == ("session.list", {"limit": 50})
+    answer(instance, "session.create", snapshot(stored="20261011_now"))
+    assert {
+        params["scope"] for method, params, _ in instance.backend.requests if method == "session.list"
+    } == {"live", "stored"}
     answer(instance, "session.list", LISTED)
     assert instance.state.earlier["id"] == "20261010_ci"  # not this new one, and not an empty one
     picked = []
@@ -814,3 +812,539 @@ def test_a_new_session_offers_the_last_one_on_the_welcome():
     )
     node.handlers["action:click"](None)
     assert picked == ["20261010_ci"]
+
+
+def event(instance, kind, payload, **envelope):
+    instance.backend.events.put(
+        {"method": "event", "params": {"session_id": "live", "type": kind, "payload": payload, **envelope}}
+    )
+    instance.read_backend()
+
+
+def test_remote_startup_uses_remote_cwd_without_gateway_options_or_shared_title():
+    instance = resuming_app(
+        gateway_host="work",
+        gateway_cwd="/remote/project",
+        gateway_hermes="/remote/bin/hermes",
+        profile="work profile",
+        model="m",
+    )
+    method, params, _ = instance.backend.requests[-1]
+    assert method == "session.create"
+    assert params["cwd"] == "/remote/project" and params["model"] == "m"
+    assert params["request_id"]
+    assert not {"title", "cols", "gateway_host", "gateway_cwd", "gateway_hermes", "profile"}.intersection(
+        params
+    )
+    remote = resuming_app(gateway_host="work")
+    assert "cwd" not in remote.backend.requests[-1][1]
+
+
+def test_resume_title_fallback_only_follows_explicit_not_found():
+    instance = resuming_app(resume="My session")
+    answer(instance, "session.resume", error={"code": 4001, "message": "not_found"})
+    assert instance.backend.requests[-1][:2] == (
+        "session.resume",
+        {"title": "My session", "display_projection": True},
+    )
+    answer(instance, "session.resume", STORED)
+    assert instance.state.stored_session_id == "20261011_abc"
+    broken = switching_app()
+    broken.resume_session("other")
+    broken.backend.requests[-1][2].set_exception(TimeoutError("no response"))
+    broken.check_requests()
+    assert broken.state.session_id == "live"
+    assert "no response" in broken.state.rows[-1].text
+    assert not any(method in ("session.create", "session.detach") for method, _, _ in broken.backend.requests)
+
+
+def test_running_resume_adopts_prompts_pending_history_and_control_generation():
+    instance = resuming_app(resume="live")
+    answer(
+        instance,
+        "session.resume",
+        snapshot(
+            stored="live",
+            running=True,
+            execution_generation=9,
+            pending=[
+                {"admission_id": "a", "input_id": "peer-input", "text": "peer work", "status": "started"}
+            ],
+            prompts=[
+                {
+                    "kind": "clarify",
+                    "prompt_id": "q",
+                    "execution_generation": 9,
+                    "question": "Which?",
+                    "choices": ["A", "B"],
+                }
+            ],
+        ),
+    )
+    assert instance.state.busy and instance.state.rows[-1].text == "peer work"
+    instance.choose("q", "A")
+    assert instance.backend.requests[-1][:2] == (
+        "clarify.respond",
+        {"session_id": "live", "prompt_id": "q", "answer": "A", "execution_generation": 9},
+    )
+    event(instance, "clarify.settled", {"prompt_id": "q"})
+    assert not instance.state.questions
+    instance.stop()
+    assert instance.backend.requests[-1][1]["execution_generation"] == 9
+
+
+def test_peer_pending_input_deduplicates_authored_turn_and_updates_fences():
+    instance = ready_app()
+    instance.submit("mine")
+    submission = instance.backend.requests[-1][1]["submission_id"]
+    payload = {
+        "running": True,
+        "revision": 15,
+        "execution_generation": 8,
+        "pending": [
+            {"admission_id": "a", "input_id": submission, "text": "mine", "status": "started"},
+            {"admission_id": "b", "input_id": "peer", "text": "theirs", "status": "queued"},
+        ],
+    }
+    event(instance, "session.info", payload)
+    event(instance, "session.info", payload)
+    assert [row.text for row in instance.state.rows if row.kind == "user"] == ["mine", "theirs"]
+    assert instance.attachment.revision == 15 and instance.attachment.execution_generation == 8
+
+
+def test_submission_failure_and_unknown_admission_never_send_queued_followup():
+    for failure in ("transport", "gap", "disconnect", "unknown"):
+        instance = ready_app()
+        instance.submit("first")
+        instance.submit("held")
+        if failure == "transport":
+            instance.backend.requests[-1][2].set_exception(BrokenPipeError("lost"))
+            instance.check_requests()
+        elif failure == "gap":
+            event(instance, "session.replay_gap", {})
+        elif failure == "unknown":
+            event(
+                instance,
+                "session.info",
+                {"running": False, "pending": [{"admission_id": "a", "status": "unknown"}]},
+            )
+        else:
+            instance.backend.events.put({"local_error": "lost"})
+            instance.read_backend()
+        event(instance, "session.info", {"running": False, "pending": []})
+        event(instance, "message.complete", {"text": "completed"})
+        assert instance.state.unknown and instance.state.queued == ["held"]
+        assert not instance.state.can_retry
+        assert [method for method, _, _ in instance.backend.requests].count("prompt.submit") == 1
+        if failure == "disconnect":
+            assert instance.state.failed and not instance.state.ready
+            assert instance.state.activity == "Disconnected"
+        assert any("Do not resend" in row.text for row in instance.state.rows)
+
+
+def test_each_authored_submission_has_a_distinct_id_and_batch_clarification():
+    instance = ready_app()
+    instance.submit("first")
+    event(instance, "message.complete", {})
+    instance.send_command("expanded", "/skill")
+    prompts = [params for method, params, _ in instance.backend.requests if method == "prompt.submit"]
+    assert len({params["submission_id"] for params in prompts}) == 2
+    assert all(params["clarify_batch"] is True for params in prompts)
+
+
+def test_picker_deduplicates_stored_lineage_and_prefers_live_session_details():
+    instance = ready_app()
+    instance.open_sessions()
+    answer(
+        instance,
+        "session.list",
+        {
+            "scope": "stored",
+            "sessions": [
+                {
+                    "id": "old-row",
+                    "session_id": "old-row",
+                    "resolved_id": "shared",
+                    "title": "stored",
+                    "started_at": 1,
+                    "message_count": 2,
+                },
+                {
+                    "id": "newer",
+                    "session_id": "newer",
+                    "title": "newest",
+                    "started_at": 9,
+                    "message_count": 1,
+                },
+            ],
+        },
+    )
+    future = next(
+        future
+        for method, params, future in instance.backend.requests
+        if method == "session.list" and params["scope"] == "live"
+    )
+    future.set_result(
+        {
+            "scope": "live",
+            "sessions": [
+                {"id": "shared", "session_id": "shared", "title": "live", "started_at": 5, "message_count": 4}
+            ],
+        }
+    )
+    instance.check_requests()
+    assert [(row["id"], row["title"]) for row in instance.state.sessions] == [
+        ("newer", "newest"),
+        ("shared", "live"),
+    ]
+
+
+def test_session_events_arriving_before_resume_result_are_applied_after_snapshot():
+    instance = resuming_app(resume="live")
+    event(instance, "message.delta", {"text": "already streaming"}, replay_epoch="epoch", seq=1)
+    assert not instance.state.rows
+    instance.backend.events.put(
+        {
+            "method": "event",
+            "params": {
+                "session_id": "live",
+                "type": "message.delta",
+                "payload": {"text": " later"},
+                "replay_epoch": "epoch",
+                "seq": 2,
+            },
+        }
+    )
+    answer(instance, "session.resume", snapshot(stored="live", running=True))
+    instance.read_backend()
+    assert [row.text for row in instance.state.rows if row.kind == "assistant"] == ["already streaming later"]
+    assert instance.attachment.last_sequence == 2 and not instance.state.unknown
+
+
+def test_model_fence_refresh_does_not_drop_streamed_reply_between_snapshots():
+    instance = ready_app()
+    instance.submit("work")
+    event(instance, "message.delta", {"text": "first"}, replay_epoch="epoch", seq=1)
+    instance.switch_model("m")
+    event(instance, "message.delta", {"text": " second"}, replay_epoch="epoch", seq=2)
+    instance.backend.events.put(
+        {
+            "method": "event",
+            "params": {
+                "session_id": "live",
+                "type": "message.delta",
+                "payload": {"text": " third"},
+                "replay_epoch": "epoch",
+                "seq": 3,
+            },
+        }
+    )
+    settled(instance, snapshot(last_sequence=2, running=True, revision=20, execution_generation=5))
+    instance.read_backend()
+    assert [row.text for row in instance.state.rows if row.kind == "assistant"] == ["first second third"]
+    assert instance.attachment.last_sequence == 3 and not instance.state.unknown
+
+
+def test_replayed_event_is_not_rendered_twice_and_missing_sequence_blocks_sends():
+    instance = ready_app()
+    event(instance, "message.delta", {"text": "once"}, replay_epoch="epoch", seq=1)
+    event(instance, "message.delta", {"text": "once"}, replay_epoch="epoch", seq=1)
+    assert [row.text for row in instance.state.rows if row.kind == "assistant"] == ["once"]
+    event(instance, "message.delta", {"text": "lost"}, replay_epoch="epoch", seq=3)
+    instance.submit("new work")
+    assert instance.state.unknown
+    assert not any(method == "prompt.submit" for method, _, _ in instance.backend.requests)
+
+
+def test_explicit_retry_has_a_new_submission_id_after_owner_retryable_failure():
+    instance = ready_app()
+    instance.submit("work")
+    first = instance.backend.requests[-1][1]["submission_id"]
+    event(
+        instance,
+        "message.complete",
+        {"status": "error", "text": "temporary failure", "error_surface": {"retryable": True}},
+    )
+    instance.retry()
+    method, params, _ = instance.backend.requests[-1]
+    assert method == "prompt.submit" and params["text"] == "work"
+    assert params["submission_id"] != first and params["clarify_batch"] is True
+
+
+def test_new_sessions_have_distinct_creation_ids_and_no_shared_title():
+    instance = app()
+    instance.create_session()
+    instance.create_session()
+    params = [params for method, params, _ in instance.backend.requests if method == "session.create"]
+    assert len({item["request_id"] for item in params}) == 2
+    assert all("title" not in item for item in params)
+
+
+def test_idle_info_before_final_keeps_local_and_resumed_peer_followups_in_order():
+    for origin in ("local", "peer"):
+        if origin == "local":
+            instance = ready_app()
+            instance.submit("first")
+            answer(instance, "prompt.submit", {"admission_id": "a", "status": "started"})
+        else:
+            instance = resuming_app(resume="live")
+            answer(
+                instance,
+                "session.resume",
+                snapshot(
+                    running=True,
+                    pending=[{"admission_id": "a", "input_id": "peer", "text": "first", "status": "started"}],
+                    display_messages=[{"role": "user", "text": "first"}],
+                ),
+            )
+        event(instance, "message.delta", {"text": "reply"})
+        instance.submit("queued")
+        event(instance, "session.info", {"running": False, "pending": []})
+        assert instance.state.busy and instance.state.activity != "Ready"
+        instance.submit("manual during gap")
+        before = [
+            params["text"] for method, params, _ in instance.backend.requests if method == "prompt.submit"
+        ]
+        assert before == (["first"] if origin == "local" else [])
+        assert instance.state.queued == ["queued", "manual during gap"]
+        event(instance, "message.complete", {"text": "reply done"}, admission_id="a")
+        assert instance.state.queued == ["manual during gap"]
+        event(instance, "message.complete", {"text": "queued reply"})
+        event(instance, "message.complete", {"text": "manual reply"})
+        assert [(row.kind, row.text) for row in instance.state.rows if row.kind in ("user", "assistant")] == [
+            ("user", "first"),
+            ("assistant", "reply done"),
+            ("user", "queued"),
+            ("assistant", "queued reply"),
+            ("user", "manual during gap"),
+            ("assistant", "manual reply"),
+        ]
+
+
+def test_each_admitted_turn_must_finish_before_a_local_followup_starts():
+    instance = ready_app()
+    instance.submit("first")
+    submission = instance.backend.requests[-1][1]["submission_id"]
+    event(
+        instance,
+        "session.info",
+        {
+            "running": True,
+            "pending": [
+                {"admission_id": "a", "input_id": submission, "text": "first", "status": "started"},
+                {"admission_id": "b", "input_id": "peer", "text": "peer", "status": "queued"},
+            ],
+        },
+    )
+    instance.submit("local followup")
+    event(instance, "session.info", {"running": False, "pending": []})
+    assert instance.state.busy
+    assert [
+        params["text"] for method, params, _ in instance.backend.requests if method == "prompt.submit"
+    ] == ["first"]
+    event(instance, "message.complete", {"text": "first reply"}, admission_id="a")
+    assert instance.state.queued == ["local followup"]
+    event(
+        instance,
+        "session.info",
+        {
+            "running": True,
+            "pending": [{"admission_id": "b", "input_id": "peer", "text": "peer", "status": "started"}],
+        },
+    )
+    event(instance, "message.start", {}, admission_id="b")
+    event(instance, "session.info", {"running": False, "pending": []})
+    assert [
+        params["text"] for method, params, _ in instance.backend.requests if method == "prompt.submit"
+    ] == ["first"]
+    event(instance, "message.complete", {"text": "peer reply"}, admission_id="b")
+    assert [
+        params["text"] for method, params, _ in instance.backend.requests if method == "prompt.submit"
+    ] == ["first", "local followup"]
+    assert [row.text for row in instance.state.rows if row.kind == "assistant"] == [
+        "first reply",
+        "peer reply",
+    ]
+
+
+def test_resume_hint_round_trips_shell_arguments_and_active_gateway(monkeypatch):
+    from hermes_for_tern import launcher
+
+    instance = App(
+        SimpleNamespace(caps=SimpleNamespace(cols=100)),
+        [],
+        Path("/project"),
+        {
+            "profile": "work's profile",
+            "gateway_host": "chosen-host",
+            "gateway_hermes": "/remote/bin/hermes custom",
+            "gateway_cwd": "/remote/a project",
+        },
+    )
+    instance.state.stored_session_id = "saved id; $(false)"
+    instance.state.title = 'Title "quoted" $HOME; `false`'
+    instance.state.begin("work")
+    commands = instance.resume_hint().splitlines()[1:]
+    flags = [
+        "-p",
+        "work's profile",
+        "--gateway-hermes",
+        "/remote/bin/hermes custom",
+        "--gateway-host",
+        "chosen-host",
+        "--gateway-cwd",
+        "/remote/a project",
+    ]
+    assert shlex.split(commands[0]) == ["hermes", "--resume", "saved id; $(false)", *flags]
+    assert shlex.split(commands[1]) == ["hermes", "-c", 'Title "quoted" $HOME; `false`', *flags]
+    monkeypatch.setattr(
+        launcher, "settings", lambda: {"original": "/stale/hermes", "gateway": {"host": "stale-host"}}
+    )
+    instance.doctor()
+    gateway = next(row.text for row in instance.state.rows if row.text.startswith("gateway: "))
+    assert "chosen-host" in gateway and "/remote/a project" in gateway and "stale-host" not in gateway
+    demo = App(SimpleNamespace(), [], Path("/project"), {"demo": 1, "gateway_host": "ignored"})
+    demo.state.stored_session_id = "saved"
+    demo.state.begin("work")
+    assert shlex.split(demo.resume_hint().splitlines()[1]) == ["hermes", "--resume", "saved"]
+
+
+def test_fence_refresh_preserves_clarification_draft_and_multiselect_until_generation_changes():
+    instance = ready_app()
+    prompt = {
+        "kind": "clarify",
+        "prompt_id": "q",
+        "execution_generation": 3,
+        "question": "Which?",
+        "choices": ["A", "B"],
+        "multi_select": True,
+    }
+    event(instance, "clarify.request", prompt)
+    instance.choose("q", "A")
+    instance.answer_draft = Draft("typed answer", 12)
+    instance.switch_model("m")
+    answer(instance, "session.resume", snapshot(running=True, prompts=[prompt]))
+    assert instance.answer_draft.text == "typed answer"
+    event(instance, "clarify.request", prompt)
+    assert instance.answer_draft.text == "typed answer"
+    instance.choose("q", None)
+    assert instance.backend.requests[-1][:2] == (
+        "clarify.respond",
+        {"session_id": "live", "prompt_id": "q", "answer": "A", "execution_generation": 3},
+    )
+    event(instance, "clarify.request", {**prompt, "execution_generation": 4})
+    assert instance.answer_draft.text == ""
+    instance.choose("q", "B")
+    instance.choose("q", None)
+    assert instance.backend.requests[-1][1]["answer"] == "B"
+    older = next(
+        future
+        for method, params, future in instance.backend.requests
+        if method == "clarify.respond" and params["execution_generation"] == 3
+    )
+    older.set_result({"prompt_id": "q"})
+    instance.check_requests()
+    assert instance.state.clarify().generation == 4
+    event(instance, "clarify.settled", {"prompt_id": "q", "execution_generation": 3})
+    assert instance.state.clarify().generation == 4
+    assert instance.backend.requests[-1][1]["answer"] == "B"
+
+
+def test_history_snapshot_discards_only_events_already_in_its_projection():
+    instance = resuming_app(resume="live")
+    event(instance, "message.delta", {"text": "already projected"}, replay_epoch="epoch", seq=1)
+    instance.backend.events.put(
+        {
+            "method": "event",
+            "params": {
+                "session_id": "live",
+                "type": "message.delta",
+                "payload": {"text": " new"},
+                "replay_epoch": "epoch",
+                "seq": 2,
+            },
+        }
+    )
+    answer(
+        instance,
+        "session.resume",
+        snapshot(
+            last_sequence=1, running=True, display_messages=[{"role": "assistant", "text": "projected"}]
+        ),
+    )
+    instance.read_backend()
+    assert [row.text for row in instance.state.rows if row.kind == "assistant"] == ["projected", " new"]
+    assert instance.attachment.last_sequence == 2 and not instance.state.unknown
+
+
+def test_fence_refresh_during_idle_final_gap_does_not_make_sending_ready():
+    instance = ready_app()
+    instance.submit("work")
+    instance.switch_model("m")
+    answer(instance, "session.resume", snapshot(running=False, pending=[]))
+    instance.submit("held")
+    assert instance.state.busy and instance.state.queued == ["held"]
+    assert [method for method, _, _ in instance.backend.requests].count("prompt.submit") == 1
+    event(instance, "message.complete", {"text": "finished"})
+    assert [
+        params["text"] for method, params, _ in instance.backend.requests if method == "prompt.submit"
+    ] == ["work", "held"]
+
+
+def test_cancelled_queued_admission_does_not_finish_the_active_reply():
+    instance = ready_app()
+    instance.submit("active")
+    submission = instance.backend.requests[-1][1]["submission_id"]
+    event(
+        instance,
+        "session.info",
+        {
+            "running": True,
+            "pending": [
+                {"admission_id": "a", "input_id": submission, "text": "active", "status": "started"},
+                {"admission_id": "cancelled", "input_id": "peer", "text": "peer", "status": "queued"},
+            ],
+        },
+    )
+    event(instance, "message.delta", {"text": "still"})
+    instance.submit("held")
+    event(
+        instance,
+        "session.info",
+        {
+            "running": True,
+            "pending": [{"admission_id": "a", "input_id": submission, "text": "active", "status": "started"}],
+        },
+    )
+    event(instance, "message.complete", {"text": "", "outcome": "cancelled"}, admission_id="cancelled")
+    event(instance, "message.delta", {"text": " writing"})
+    assert instance.state.busy and instance.state.queued == ["held"]
+    assert [row.text for row in instance.state.rows if row.kind == "assistant"] == ["still writing"]
+    assert not any(row.kind == "delivered" for row in instance.state.rows)
+    event(instance, "session.info", {"running": False, "pending": []})
+    event(instance, "message.complete", {"text": "finished"}, admission_id="a")
+    assert [
+        params["text"] for method, params, _ in instance.backend.requests if method == "prompt.submit"
+    ] == ["active", "held"]
+
+
+def test_model_command_separates_explicit_provider_from_model_id():
+    for raw in ("gpt-6-luna --provider openai-codex", "--provider=openai-codex gpt-6-luna"):
+        instance = ready_app()
+        instance.run_command("/model " + raw)
+        settled(instance, snapshot())
+        params = instance.backend.requests[-1][1]
+        assert params["payload"] == {"model": "gpt-6-luna", "provider": "openai-codex"}
+        settled(
+            instance, {"operation": "model", "model": "gpt-6-luna", "provider": "openai-codex", "revision": 8}
+        )
+        assert instance.state.info["model"] == "gpt-6-luna"
+        assert instance.state.info["provider"] == "openai-codex"
+
+
+def test_catalog_pick_uses_its_provider_even_for_a_unique_model_name():
+    instance = ready_app()
+    instance.state.models = CATALOG
+    instance.switch_model("claude-haiku-4")
+    settled(instance, snapshot())
+    assert instance.backend.requests[-1][1]["payload"] == {"model": "claude-haiku-4", "provider": "anthropic"}
